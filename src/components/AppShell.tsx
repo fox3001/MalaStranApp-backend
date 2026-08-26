@@ -46,7 +46,7 @@ export function AppShell({ area, title, children, back, notifications }: AppShel
       <header
         className={cn(
           "sticky top-0 z-40 border-b border-border-strong shadow-[var(--shadow-header)] pt-safe",
-          isAdmin ? "bg-surface/95 backdrop-blur-md" : "bg-primary",
+          isAdmin ? "bg-[#287577]" : "bg-primary",
         )}
       >
         <div className="mx-auto flex max-w-5xl items-center justify-between px-4 py-3">
@@ -58,7 +58,7 @@ export function AppShell({ area, title, children, back, notifications }: AppShel
                 className={cn(
                   "inline-flex h-10 w-10 items-center justify-center rounded-lg border transition-colors active:bg-muted",
                   isAdmin
-                    ? "border-border-strong bg-surface text-primary"
+                    ? "border-white/20 bg-white/10 text-white active:bg-white/20"
                     : "border-white/20 bg-white/10 text-white active:bg-white/20",
                 )}
               >
@@ -70,8 +70,8 @@ export function AppShell({ area, title, children, back, notifications }: AppShel
             <div>
               {isAdmin ? (
                 <>
-                  <p className="eyebrow text-primary/70">UFFICIO & REGIA</p>
-                  <h1 className="font-serif text-xl leading-tight text-primary">{title}</h1>
+                  <p className="eyebrow text-white">UFFICIO & REGIA</p>
+                  <h1 className="font-serif text-xl leading-tight text-white">Admin</h1>
                 </>
               ) : (
                 <p className="font-serif text-lg font-semibold tracking-[0.12em] text-white">
@@ -83,10 +83,10 @@ export function AppShell({ area, title, children, back, notifications }: AppShel
           {/* Right side */}
           {isAdmin ? (
             <Link to="/admin" className="text-right">
-              <p className="font-serif text-sm font-semibold tracking-[0.14em] text-primary">
+              <p className="font-serif text-sm font-semibold tracking-[0.14em] text-white">
                 MALASTRANA
               </p>
-              <p className="font-sans text-[8px] uppercase tracking-[0.24em] text-accent">
+              <p className="font-sans text-[8px] uppercase tracking-[0.24em] text-white/80">
                 Eventi senza tempo
               </p>
             </Link>
