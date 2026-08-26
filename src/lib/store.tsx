@@ -113,6 +113,7 @@ interface DemoState {
   setAvailability: (eventId: string, response: AvailabilityResponse) => void;
   setAvailabilityResponse: (eventId: string, response: AvailabilityResponse) => void;
   clearAvailabilityResponse: (eventId: string) => void;
+  addCollaborator: (collaborator: { name: string; role: string }) => string;
   addCostume: (costume: Omit<Costume, "id" | "verification" | "owner">) => void;
   updateLoadRow: (id: string, patch: Partial<LoadRow>, note?: string) => void;
   addBolla: (bolla: Bolla) => void;
@@ -196,6 +197,13 @@ export function DemoProvider({ children }: { children: ReactNode }) {
       /* noop */
     }
   }, [state]);
+
+  const addCollaborator = useCallback((collaborator: { name: string; role: string }) => {
+    const id = `collab-${Date.now()}`;
+    const baseCollaborator: Collaborator = { id, name: collaborator.name, role: collaborator.role, skills: [], state: "disponibile" };
+    setState((s) => ({ ...s, collaborators: [toCollaboratorExtended(baseCollaborator), ...s.collaborators] }));
+    return id;
+  }, []);
 
   const setAvailability = useCallback((eventId: string, response: AvailabilityResponse) => {
     setState((s) => ({ ...s, availability: { ...s.availability, [eventId]: response } }));
@@ -346,6 +354,7 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     setAvailability,
     setAvailabilityResponse: setAvailability,
     clearAvailabilityResponse,
+    addCollaborator,
     addCostume,
     updateLoadRow,
     addBolla,
@@ -365,7 +374,7 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     addPersonalCostume,
     addPersonalPhoto,
     flagSkill,
-  }), [state, setAvailability, clearAvailabilityResponse, addCostume, updateLoadRow, addBolla, closeBolla, reopenBolla, setBollaTeamLeader, setBollaItemStatus, updateEvent, closeEventByTL, approveEventClosure, addSkillToCollaborator, verifyCollaboratorSkill, proposeSkill, updateCollaborator, setEventTeamMember, removeEventTeamMember, addPersonalCostume, addPersonalPhoto, flagSkill]);
+  }), [state, setAvailability, clearAvailabilityResponse, addCollaborator, addCostume, updateLoadRow, addBolla, closeBolla, reopenBolla, setBollaTeamLeader, setBollaItemStatus, updateEvent, closeEventByTL, approveEventClosure, addSkillToCollaborator, verifyCollaboratorSkill, proposeSkill, updateCollaborator, setEventTeamMember, removeEventTeamMember, addPersonalCostume, addPersonalPhoto, flagSkill]);
 
   return <DemoContext.Provider value={value}>{children}</DemoContext.Provider>;
 }
