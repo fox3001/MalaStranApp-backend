@@ -6,13 +6,9 @@ import { COLLABORATORS, NOTIFICATIONS } from "@/data/demo";
 import {
   AlertTriangle,
   BellRing,
-  Boxes,
   CalendarDays,
   CheckCircle2,
-  ClipboardList,
   PackageSearch,
-  Search,
-  Shirt,
   Users,
   XCircle,
 } from "lucide-react";
@@ -38,12 +34,10 @@ export const Route = createFileRoute("/admin/")({
   component: AdminHome,
 });
 
-const SHORTCUTS = [
-  { to: "/admin/eventi", label: "Gestisci eventi", icon: CalendarDays },
+const QUICK_ACCESS = [
+  { to: "/admin/eventi", label: "Eventi", icon: CalendarDays },
   { to: "/admin/collaboratori", label: "Collaboratori", icon: Users },
-  { to: "/admin/costumi", label: "Ricerca costumi", icon: Search },
   { to: "/admin/calendario", label: "Calendario", icon: CalendarDays },
-  { to: "/admin/altro", label: "Magazzino e moduli", icon: Boxes },
 ];
 
 function AdminHome() {
@@ -70,6 +64,26 @@ function AdminHome() {
         <p className="mt-1 text-sm text-muted-foreground">
           Priorita, convocazioni e controllo operativo in un solo punto.
         </p>
+      </section>
+
+      {/* Quick access tiles */}
+      <section className="mt-6">
+        <div className="grid grid-cols-3 gap-3">
+          {QUICK_ACCESS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <Link
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                to={item.to as any}
+                key={item.to}
+                className="flex flex-col items-center justify-center gap-2 rounded-xl border border-border bg-card p-4 text-center shadow-[var(--shadow-card)] active:scale-[0.98] active:bg-muted"
+              >
+                <Icon className="h-6 w-6 text-accent" strokeWidth={1.5} />
+                <span className="eyebrow text-xs text-foreground">{item.label}</span>
+              </Link>
+            );
+          })}
+        </div>
       </section>
 
       {/* Priority banner */}
@@ -112,7 +126,7 @@ function AdminHome() {
           <StatCard icon={CalendarDays} value={sorted.length} label="Eventi attivi" to="/admin/eventi" tone="primary" />
           <StatCard icon={BellRing} value={unanswered.length} label="Da rispondere" to="/admin/eventi" tone="accent" />
           <StatCard icon={CheckCircle2} value={confirmed.length} label="Confermati" to="/admin/eventi" tone="primary" />
-          <StatCard icon={PackageSearch} value={inventoryTotal} label="Inventario" to="/admin/costumi" tone="primary" />
+          <StatCard icon={PackageSearch} value={inventoryTotal} label="Inventario" to="/admin/eventi" tone="primary" />
         </div>
       </section>
 
@@ -254,53 +268,6 @@ function AdminHome() {
                 </Link>
               </li>
             ))}
-          </ul>
-        </Card>
-      </section>
-
-      {/* Material control */}
-      <section className="mt-8">
-        <SectionTitle>Controllo materiale</SectionTitle>
-        <div className="grid grid-cols-2 gap-3">
-          <Link
-            to="/admin/costumi"
-            className="rounded-xl border border-border bg-card p-4 shadow-[var(--shadow-card)] active:scale-[0.98] active:bg-muted"
-          >
-            <Shirt className="h-5 w-5 text-accent" strokeWidth={1.5} />
-            <p className="mt-3 font-serif text-2xl text-primary">{costumes.length}</p>
-            <p className="eyebrow mt-1 text-muted-foreground">Costumi</p>
-          </Link>
-          <Link
-            to="/admin/altro"
-            className="rounded-xl border border-border bg-card p-4 shadow-[var(--shadow-card)] active:scale-[0.98] active:bg-muted"
-          >
-            <ClipboardList className="h-5 w-5 text-accent" strokeWidth={1.5} />
-            <p className="mt-3 font-serif text-2xl text-primary">{gear.length}</p>
-            <p className="eyebrow mt-1 text-muted-foreground">Materiali</p>
-          </Link>
-        </div>
-      </section>
-
-      {/* Shortcuts */}
-      <section className="mt-8">
-        <SectionTitle>Accessi rapidi</SectionTitle>
-        <Card>
-          <ul>
-            {SHORTCUTS.map((s) => {
-              const Icon = s.icon;
-              return (
-                <li key={s.to} className="border-b border-border last:border-b-0">
-                  <Link
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    to={s.to as any}
-                    className="flex min-h-14 items-center gap-3 py-3 text-sm text-foreground active:bg-muted"
-                  >
-                    <Icon className="h-5 w-5 shrink-0 text-accent" strokeWidth={1.4} />
-                    <span className="min-w-0 truncate">{s.label}</span>
-                  </Link>
-                </li>
-              );
-            })}
           </ul>
         </Card>
       </section>
