@@ -53,7 +53,7 @@ export interface CollaboratorExtended extends Collaborator {
   email?: string;
   skillsDetail: CollaboratorSkill[];
   proposedSkills: string[];
-  flaggedSkills: string[];
+  flaggedSkills: [];
   personalCostumes: PersonalCostume[];
   personalPhotos: PersonalPhoto[];
 }
