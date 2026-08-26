@@ -1,388 +1,363 @@
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useState,
-  type ReactNode,
-} from "react";
-import {
-  EVENTS,
-  COLLABORATORS,
-  COSTUMES,
-  GEAR,
-  LOAD_ROWS,
-  NOTIFICATIONS,
-  type Collaborator,
-  type Costume,
-  type GearItem,
-  type LoadRow,
-  type MalEvent,
-} from "@/data/demo";
+import { createContext, useContext, useMemo, useState, useEffect } from 'react';
 
-export type AvailabilityResponse = "yes" | "no" | "disponibile" | "non_disponibile" | "da_definire";
-export type BollaItemStatus = "presente" | "danneggiato" | "mancante";
-export type EventStatus = "richiesta" | "da_definire" | "confermato" | "annullato" | "chiuso";
-export type SkillVerification = "verificata" | "in_verifica" | "proposta";
+// ==================== TYPES ====================
 
-export interface CollaboratorSkill {
+export interface User {
+  id: number;
+  email: string;
   name: string;
-  status: SkillVerification;
-  verifiedAt?: string;
+  role: 'admin' | 'user';
+  avatar_url?: string;
+  created_at: string;
+  updated_at: string;
 }
 
-export interface PersonalPhoto {
-  id: string;
-  url: string;
-  tags: string[];
-  caption?: string;
-  uploadedAt: string;
+export interface Event {
+  id: number;
+  code: string;
+  title: string;
+  description?: string;
+  start_date?: string;
+  end_date?: string;
+  location?: string;
+  color: string;
+  is_active: number;
+  created_at: string;
+  updated_at: string;
 }
 
-export interface PersonalCostume {
-  id: string;
-  name: string;
-  category: string;
-  tags: string[];
-  notes?: string;
-}
-
-export interface CollaboratorExtended extends Collaborator {
+export interface Collaborator {
+  id: number;
+  user_id: number;
   phone?: string;
-  email?: string;
-  skillsDetail: CollaboratorSkill[];
-  proposedSkills: string[];
-  flaggedSkills: [];
-  personalCostumes: PersonalCostume[];
-  personalPhotos: PersonalPhoto[];
-}
-
-export interface EventTeamMember {
-  collaboratorId: string;
-  role: string;
-  isTeamLeader: boolean;
-}
-
-export interface BollaItem {
-  id: string;
-  code: string;
-  name: string;
-  type: "costume" | "oggetto" | "scenografia";
-  size: string;
-  qty: number;
   notes?: string;
+  is_active: number;
+  created_at: string;
+  updated_at: string;
+  email?: string;
+  name?: string;
+  role?: string;
+  avatar_url?: string;
 }
 
-export interface Bolla {
-  id: string;
-  code: string;
-  date: string;
-  eventCode: string;
-  items: BollaItem[];
-  closed: boolean;
-  teamLeaderId?: string;
+export interface Costume {
+  id: number;
+  name: string;
+  description?: string;
+  size?: string;
+  event_id?: number;
+  image_url?: string;
+  is_active: number;
+  created_at: string;
+  updated_at: string;
+  event_title?: string;
+  event_code?: string;
 }
 
-export interface MalEventExtended extends MalEvent {
-  contactName?: string;
-  contactPhone?: string;
-  adminNotes?: string;
-  tlComments?: string;
-  tlClosedAt?: string;
-  adminApprovedAt?: string;
-  team?: EventTeamMember[];
+export interface Material {
+  id: number;
+  name: string;
+  description?: string;
+  quantity: number;
+  event_id?: number;
+  image_url?: string;
+  is_active: number;
+  created_at: string;
+  updated_at: string;
+  event_title?: string;
+  event_code?: string;
 }
 
-export interface TimelineEntry {
-  id: string;
-  text: string;
-  at: string;
+export interface Availability {
+  id: number;
+  collaborator_id: number;
+  event_id: number;
+  is_available: number;
+  notes?: string;
+  created_at: string;
+  updated_at: string;
+  collaborator_name?: string;
+  event_title?: string;
+  event_code?: string;
 }
 
-interface DemoState {
-  events: MalEventExtended[];
-  collaborators: CollaboratorExtended[];
+export interface Assignment {
+  id: number;
+  collaborator_id: number;
+  event_id: number;
+  costume_id?: number;
+  material_id?: number;
+  notes?: string;
+  created_at: string;
+  updated_at: string;
+  collaborator_name?: string;
+  event_title?: string;
+  costume_name?: string;
+  material_name?: string;
+}
+
+export interface Notification {
+  id: number;
+  user_id: number;
+  title: string;
+  message: string;
+  type: string;
+  is_read: number;
+  created_at: string;
+  user_name?: string;
+}
+
+// ==================== API HELPERS ====================
+
+const API_BASE = '/api';
+
+async function apiGet<T>(endpoint: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${endpoint}`);
+  if (!res.ok) throw new Error(`API error: ${res.status}`);
+  const data = await res.json();
+  return data as T;
+}
+
+async function apiPost<T>(endpoint: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`API error: ${res.status}`);
+  const data = await res.json();
+  return data as T;
+}
+
+async function apiPut<T>(endpoint: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${endpoint}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`API error: ${res.status}`);
+  const data = await res.json();
+  return data as T;
+}
+
+// ==================== CONTEXT ====================
+
+interface DemoContextType {
+  // Auth
+  currentUser: User | null;
+  login: (email: string, password: string) => Promise<User>;
+  logout: () => void;
+  
+  // Data
+  users: User[];
+  events: Event[];
+  collaborators: Collaborator[];
   costumes: Costume[];
-  gear: GearItem[];
-  load: LoadRow[];
-  timeline: TimelineEntry[];
-  availability: Record<string, AvailabilityResponse | undefined>;
-  bolle: Bolla[];
-  bollaItemsState: Record<string, BollaItemStatus | undefined>;
-  setAvailability: (eventId: string, response: AvailabilityResponse) => void;
-  setAvailabilityResponse: (eventId: string, response: AvailabilityResponse) => void;
-  clearAvailabilityResponse: (eventId: string) => void;
-  addCollaborator: (collaborator: { name: string; role: string }) => string;
-  addCostume: (costume: Omit<Costume, "id" | "verification" | "owner">) => void;
-  updateLoadRow: (id: string, patch: Partial<LoadRow>, note?: string) => void;
-  addBolla: (bolla: Bolla) => void;
-  closeBolla: (bollaCode: string) => void;
-  reopenBolla: (bollaCode: string) => void;
-  setBollaTeamLeader: (bollaCode: string, collaboratorId: string) => void;
-  setBollaItemStatus: (itemId: string, status: BollaItemStatus) => void;
-  updateEvent: (code: string, updates: Partial<MalEventExtended>) => void;
-  closeEventByTL: (code: string, comments?: string) => void;
-  approveEventClosure: (code: string) => void;
-  addSkillToCollaborator: (collaboratorId: string, skill: string) => void;
-  verifyCollaboratorSkill: (collaboratorId: string, skill: string) => void;
-  proposeSkill: (collaboratorId: string, skill: string) => void;
-  updateCollaborator: (collaboratorId: string, updates: Partial<Pick<CollaboratorExtended, "phone" | "email" | "bio" | "role" | "state">>) => void;
-  setEventTeamMember: (eventCode: string, member: EventTeamMember) => void;
-  removeEventTeamMember: (eventCode: string, collaboratorId: string) => void;
-  addPersonalCostume: (collaboratorId: string, costume: { name: string; category: string; tags: string[]; notes?: string }) => void;
-  addPersonalPhoto: (collaboratorId: string, photo: { url: string; tags: string[]; caption?: string }) => void;
-  flagSkill: (collaboratorId: string, skill: string) => void;
+  materials: Material[];
+  availability: Availability[];
+  assignments: Assignment[];
+  notifications: Notification[];
+  
+  // Actions - Events
+  addEvent: (event: Omit<Event, 'id' | 'created_at' | 'updated_at' | 'is_active'>) => Promise<Event>;
+  updateEvent: (id: number, updates: Partial<Event>) => Promise<Event>;
+  
+  // Actions - Collaborators
+  addCollaborator: (name: string, email: string, password: string, phone?: string, notes?: string) => Promise<{user: User, collaborator: Collaborator}>;
+  
+  // Actions - Costumes
+  addCostume: (costume: Omit<Costume, 'id' | 'created_at' | 'updated_at' | 'is_active'>) => Promise<Costume>;
+  
+  // Actions - Materials
+  addMaterial: (material: Omit<Material, 'id' | 'created_at' | 'updated_at' | 'is_active'>) => Promise<Material>;
+  
+  // Actions - Availability
+  setAvailability: (collaborator_id: number, event_id: number, is_available: number, notes?: string) => Promise<Availability>;
+  
+  // Actions - Assignments
+  addAssignment: (assignment: Omit<Assignment, 'id' | 'created_at' | 'updated_at'>) => Promise<Assignment>;
 }
 
-const STORAGE_KEY = "malastrana-demo-v3";
-const DemoContext = createContext<DemoState | null>(null);
+const DemoContext = createContext<DemoContextType | null>(null);
 
-const toCollaboratorExtended = (collaborator: Collaborator): CollaboratorExtended => ({
-  ...collaborator,
-  phone: "",
-  email: "",
-  skillsDetail: collaborator.skills.map((name) => ({ name, status: "in_verifica" })),
-  proposedSkills: [],
-  flaggedSkills: [],
-  personalCostumes: [],
-  personalPhotos: [],
-});
-
-interface Persisted {
-  availability: Record<string, AvailabilityResponse | undefined>;
-  costumes: Costume[];
-  load: LoadRow[];
-  timeline: TimelineEntry[];
-  bolle: Bolla[];
-  bollaItemsState: Record<string, BollaItemStatus | undefined>;
-  events: MalEventExtended[];
-  collaborators: CollaboratorExtended[];
-}
-
-const initial: Persisted = {
-  availability: {},
-  costumes: COSTUMES,
-  load: LOAD_ROWS,
-  timeline: [],
-  bolle: [],
-  bollaItemsState: {},
-  collaborators: COLLABORATORS.map(toCollaboratorExtended),
-  events: EVENTS.map((e) => ({
-    ...e,
-    contactName: "",
-    contactPhone: "",
-    adminNotes: "",
-    tlComments: "",
-    team: [],
-  })),
-};
-
-export function DemoProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<Persisted>(initial);
-
-  useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw) setState({ ...initial, ...(JSON.parse(raw) as Partial<Persisted>) });
-    } catch {
-      /* prototipo: ignora storage non disponibile */
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    } catch {
-      /* noop */
-    }
-  }, [state]);
-
-  const addCollaborator = useCallback((collaborator: { name: string; role: string }) => {
-    const id = `collab-${Date.now()}`;
-    const baseCollaborator: Collaborator = { id, name: collaborator.name, role: collaborator.role, skills: [], state: "disponibile" };
-    setState((s) => ({ ...s, collaborators: [toCollaboratorExtended(baseCollaborator), ...s.collaborators] }));
-    return id;
-  }, []);
-
-  const setAvailability = useCallback((eventId: string, response: AvailabilityResponse) => {
-    setState((s) => ({ ...s, availability: { ...s.availability, [eventId]: response } }));
-  }, []);
-
-  const clearAvailabilityResponse = useCallback((eventId: string) => {
-    setState((s) => {
-      const availability = { ...s.availability };
-      delete availability[eventId];
-      return { ...s, availability };
-    });
-  }, []);
-
-  const addCostume = useCallback((costume: Omit<Costume, "id" | "verification" | "owner">) => {
-    setState((s) => ({
-      ...s,
-      costumes: [{ ...costume, id: `cos-${Date.now()}`, verification: "inserito", owner: "Elena Rossi" }, ...s.costumes],
-    }));
-  }, []);
-
-  const updateLoadRow = useCallback((id: string, patch: Partial<LoadRow>, note?: string) => {
-    setState((s) => ({
-      ...s,
-      load: s.load.map((r) => (r.id === id ? { ...r, ...patch } : r)),
-      timeline: note ? [{ id: `tl-${Date.now()}`, text: note, at: new Date().toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }) }, ...s.timeline] : s.timeline,
-    }));
-  }, []);
-
-  const addBolla = useCallback((bolla: Bolla) => setState((s) => ({ ...s, bolle: [...s.bolle, bolla] })), []);
-  const closeBolla = useCallback((bollaCode: string) => setState((s) => ({ ...s, bolle: s.bolle.map((b) => b.code === bollaCode ? { ...b, closed: true } : b) })), []);
-  const reopenBolla = useCallback((bollaCode: string) => setState((s) => ({ ...s, bolle: s.bolle.map((b) => b.code === bollaCode ? { ...b, closed: false } : b) })), []);
-  const setBollaTeamLeader = useCallback((bollaCode: string, collaboratorId: string) => setState((s) => ({ ...s, bolle: s.bolle.map((b) => b.code === bollaCode ? { ...b, teamLeaderId: collaboratorId } : b) })), []);
-  const setBollaItemStatus = useCallback((itemId: string, status: BollaItemStatus) => setState((s) => ({ ...s, bollaItemsState: { ...s.bollaItemsState, [itemId]: status } })), []);
-
-  const updateEvent = useCallback((code: string, updates: Partial<MalEventExtended>) => {
-    setState((s) => ({ ...s, events: s.events.map((e) => e.code === code ? { ...e, ...updates } : e) }));
-  }, []);
-
-  const closeEventByTL = useCallback((code: string, comments?: string) => {
-    setState((s) => ({
-      ...s,
-      events: s.events.map((e) => e.code === code ? { ...e, status: "chiuso" as EventStatus, tlComments: comments || "", tlClosedAt: new Date().toISOString() } : e),
-    }));
-  }, []);
-
-  const approveEventClosure = useCallback((code: string) => {
-    setState((s) => ({ ...s, events: s.events.map((e) => e.code === code ? { ...e, adminApprovedAt: new Date().toISOString() } : e) }));
-  }, []);
-
-  const addSkillToCollaborator = useCallback((collaboratorId: string, skill: string) => {
-    const normalized = skill.trim().startsWith("#") ? skill.trim() : `#${skill.trim().replace(/\s+/g, "")}`;
-    if (!normalized || normalized === "#") return;
-    setState((s) => ({
-      ...s,
-      collaborators: s.collaborators.map((c) => c.id !== collaboratorId || c.skillsDetail.some((item) => item.name.toLowerCase() === normalized.toLowerCase())
-        ? c
-        : { ...c, skills: [...c.skills, normalized], skillsDetail: [...c.skillsDetail, { name: normalized, status: "in_verifica" }] }),
-    }));
-  }, []);
-
-  const verifyCollaboratorSkill = useCallback((collaboratorId: string, skill: string) => {
-    setState((s) => ({
-      ...s,
-      collaborators: s.collaborators.map((c) => c.id !== collaboratorId ? c : {
-        ...c,
-        skillsDetail: c.skillsDetail.map((item) => item.name === skill ? { ...item, status: "verificata", verifiedAt: new Date().toISOString() } : item),
-        proposedSkills: c.proposedSkills.filter((item) => item !== skill),
-      }),
-    }));
-  }, []);
-
-  const proposeSkill = useCallback((collaboratorId: string, skill: string) => {
-    const normalized = skill.trim().startsWith("#") ? skill.trim() : `#${skill.trim().replace(/\s+/g, "")}`;
-    if (!normalized || normalized === "#") return;
-    setState((s) => ({
-      ...s,
-      collaborators: s.collaborators.map((c) => c.id !== collaboratorId || c.proposedSkills.includes(normalized)
-        ? c
-        : { ...c, proposedSkills: [...c.proposedSkills, normalized] }),
-    }));
-  }, []);
-
-  const updateCollaborator = useCallback((collaboratorId: string, updates: Partial<Pick<CollaboratorExtended, "phone" | "email" | "bio" | "role" | "state">>) => {
-    setState((s) => ({ ...s, collaborators: s.collaborators.map((c) => c.id === collaboratorId ? { ...c, ...updates } : c) }));
-  }, []);
-
-  const setEventTeamMember = useCallback((eventCode: string, member: EventTeamMember) => {
-    setState((s) => ({
-      ...s,
-      events: s.events.map((event) => {
-        if (event.code !== eventCode) return event;
-        const team = event.team || [];
-        const withoutMember = team.filter((item) => item.collaboratorId !== member.collaboratorId);
-        const withoutOtherTl = member.isTeamLeader ? withoutMember.map((item) => ({ ...item, isTeamLeader: false })) : withoutMember;
-        return { ...event, team: [...withoutOtherTl, member] };
-      }),
-    }));
-  }, []);
-
-  const removeEventTeamMember = useCallback((eventCode: string, collaboratorId: string) => {
-    setState((s) => ({ ...s, events: s.events.map((event) => event.code === eventCode ? { ...event, team: (event.team || []).filter((item) => item.collaboratorId !== collaboratorId) } : event) }));
-  }, []);
-
-  const addPersonalCostume = useCallback((collaboratorId: string, costume: { name: string; category: string; tags: string[]; notes?: string }) => {
-    setState((s) => ({
-      ...s,
-      collaborators: s.collaborators.map((c) => c.id !== collaboratorId ? c : {
-        ...c,
-        personalCostumes: [...c.personalCostumes, { id: `pc-${Date.now()}`, ...costume }],
-      }),
-    }));
-  }, []);
-
-  const addPersonalPhoto = useCallback((collaboratorId: string, photo: { url: string; tags: string[]; caption?: string }) => {
-    setState((s) => ({
-      ...s,
-      collaborators: s.collaborators.map((c) => c.id !== collaboratorId ? c : {
-        ...c,
-        personalPhotos: [...c.personalPhotos, { id: `ph-${Date.now()}`, ...photo, uploadedAt: new Date().toISOString() }],
-      }),
-    }));
-  }, []);
-
-  const flagSkill = useCallback((collaboratorId: string, skill: string) => {
-    setState((s) => ({
-      ...s,
-      collaborators: s.collaborators.map((c) => {
-        if (c.id !== collaboratorId) return c;
-        const isFlagged = c.flaggedSkills.includes(skill);
-        return {
-          ...c,
-          flaggedSkills: isFlagged ? c.flaggedSkills.filter((s2) => s2 !== skill) : [...c.flaggedSkills, skill],
-        };
-      }),
-    }));
-  }, []);
-
-  const value = useMemo<DemoState>(() => ({
-    events: state.events,
-    collaborators: state.collaborators,
-    gear: GEAR,
-    costumes: state.costumes,
-    load: state.load,
-    timeline: state.timeline,
-    availability: state.availability,
-    bolle: state.bolle,
-    bollaItemsState: state.bollaItemsState,
-    setAvailability,
-    setAvailabilityResponse: setAvailability,
-    clearAvailabilityResponse,
-    addCollaborator,
-    addCostume,
-    updateLoadRow,
-    addBolla,
-    closeBolla,
-    reopenBolla,
-    setBollaTeamLeader,
-    setBollaItemStatus,
-    updateEvent,
-    closeEventByTL,
-    approveEventClosure,
-    addSkillToCollaborator,
-    verifyCollaboratorSkill,
-    proposeSkill,
-    updateCollaborator,
-    setEventTeamMember,
-    removeEventTeamMember,
-    addPersonalCostume,
-    addPersonalPhoto,
-    flagSkill,
-  }), [state, setAvailability, clearAvailabilityResponse, addCollaborator, addCostume, updateLoadRow, addBolla, closeBolla, reopenBolla, setBollaTeamLeader, setBollaItemStatus, updateEvent, closeEventByTL, approveEventClosure, addSkillToCollaborator, verifyCollaboratorSkill, proposeSkill, updateCollaborator, setEventTeamMember, removeEventTeamMember, addPersonalCostume, addPersonalPhoto, flagSkill]);
-
-  return <DemoContext.Provider value={value}>{children}</DemoContext.Provider>;
-}
-
-export function useDemo() {
+export function useDemoContext() {
   const ctx = useContext(DemoContext);
-  if (!ctx) throw new Error("useDemo deve essere usato dentro DemoProvider");
+  if (!ctx) throw new Error('useDemoContext must be used within DemoProvider');
   return ctx;
 }
 
-export { COLLABORATORS, NOTIFICATIONS };
+// ==================== PROVIDER ====================
+
+export function DemoProvider({ children }: { children: React.ReactNode }) {
+  // State
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [users, setUsers] = useState<User[]>([]);
+  const [events, setEvents] = useState<Event[]>([]);
+  const [collaborators, setCollaborators] = useState<Collaborator[]>([]);
+  const [costumes, setCostumes] = useState<Costume[]>([]);
+  const [materials, setMaterials] = useState<Material[]>([]);
+  const [availability, setAvailabilityData] = useState<Availability[]>([]);
+  const [assignments, setAssignments] = useState<Assignment[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  
+  const [isLoading, setIsLoading] = useState(true);
+
+  // Load all data on mount
+  useEffect(() => {
+    async function loadData() {
+      try {
+        const [eventsData, collaboratorsData, costumesData, materialsData, availabilityData, assignmentsData] = await Promise.all([
+          apiGet<{ events: Event[] }>('/api/events').then(r => r.events),
+          apiGet<{ collaborators: Collaborator[] }>('/api/collaborators').then(r => r.collaborators),
+          apiGet<{ costumes: Costume[] }>('/api/costumes').then(r => r.costumes),
+          apiGet<{ materials: Material[] }>('/api/materials').then(r => r.materials),
+          apiGet<{ availability: Availability[] }>('/api/availability').then(r => r.availability),
+          apiGet<{ assignments: Assignment[] }>('/api/assignments').then(r => r.assignments),
+        ]);
+        
+        setEvents(eventsData);
+        setCollaborators(collaboratorsData);
+        setCostumes(costumesData);
+        setMaterials(materialsData);
+        setAvailabilityData(availabilityData);
+        setAssignments(assignmentsData);
+      } catch (error) {
+        console.error('Failed to load data:', error);
+      } finally {
+        setIsLoading(false);
+      }
+    }
+    
+    loadData();
+  }, []);
+
+  // Load notifications when user logs in
+  useEffect(() => {
+    if (!currentUser) return;
+    
+    apiGet<{ notifications: Notification[] }>(`/api/notifications/${currentUser.id}`)
+      .then(r => setNotifications(r.notifications))
+      .catch(console.error);
+  }, [currentUser]);
+
+  // Actions
+  const login = async (email: string, password: string): Promise<User> => {
+    const { user } = await apiPost<{ user: User }>('/api/auth/login', { email, password });
+    setCurrentUser(user);
+    return user;
+  };
+
+  const logout = () => {
+    setCurrentUser(null);
+    setNotifications([]);
+  };
+
+  const addEvent = async (eventData: Omit<Event, 'id' | 'created_at' | 'updated_at' | 'is_active'>): Promise<Event> => {
+    const { event } = await apiPost<{ event: Event }>('/api/events', eventData);
+    setEvents(prev => [...prev, event]);
+    return event;
+  };
+
+  const updateEvent = async (id: number, updates: Partial<Event>): Promise<Event> => {
+    const { event } = await apiPut<{ event: Event }>(`/api/events/${id}`, updates);
+    setEvents(prev => prev.map(e => e.id === id ? event : e));
+    return event;
+  };
+
+  const addCollaborator = async (
+    name: string,
+    email: string,
+    password: string,
+    phone?: string,
+    notes?: string
+  ): Promise<{user: User, collaborator: Collaborator}> => {
+    // Crea prima l'utente
+    const { user } = await apiPost<{ user: User }>('/api/auth/register', {
+      email,
+      password,
+      name,
+      role: 'user'
+    });
+    
+    // Poi crea il collaboratore
+    const { collaborator } = await apiPost<{ collaborator: Collaborator }>('/api/collaborators', {
+      user_id: user.id,
+      phone,
+      notes
+    });
+    
+    setUsers(prev => [...prev, user]);
+    setCollaborators(prev => [...prev, collaborator]);
+    
+    return { user, collaborator };
+  };
+
+  const addCostume = async (costumeData: Omit<Costume, 'id' | 'created_at' | 'updated_at' | 'is_active'>): Promise<Costume> => {
+    const { costume } = await apiPost<{ costume: Costume }>('/api/costumes', costumeData);
+    setCostumes(prev => [...prev, costume]);
+    return costume;
+  };
+
+  const addMaterial = async (materialData: Omit<Material, 'id' | 'created_at' | 'updated_at' | 'is_active'>): Promise<Material> => {
+    const { material } = await apiPost<{ material: Material }>('/api/materials', materialData);
+    setMaterials(prev => [...prev, material]);
+    return material;
+  };
+
+  const setAvailability = async (
+    collaborator_id: number,
+    event_id: number,
+    is_available: number,
+    notes?: string
+  ): Promise<Availability> => {
+    const { availability: newAvailability } = await apiPost<{ availability: Availability }>('/api/availability', {
+      collaborator_id,
+      event_id,
+      is_available,
+      notes
+    });
+    
+    setAvailabilityData(prev => {
+      const existing = prev.find(a => a.collaborator_id === collaborator_id && a.event_id === event_id);
+      if (existing) {
+        return prev.map(a => a.collaborator_id === collaborator_id && a.event_id === event_id ? newAvailability : a);
+      }
+      return [...prev, newAvailability];
+    });
+    
+    return newAvailability;
+  };
+
+  const addAssignment = async (assignmentData: Omit<Assignment, 'id' | 'created_at' | 'updated_at'>): Promise<Assignment> => {
+    const { assignment } = await apiPost<{ assignment: Assignment }>('/api/assignments', assignmentData);
+    setAssignments(prev => [...prev, assignment]);
+    return assignment;
+  };
+
+  const value = useMemo<DemoContextType>(() => ({
+    currentUser,
+    login,
+    logout,
+    users,
+    events,
+    collaborators,
+    costumes,
+    materials,
+    availability,
+    assignments,
+    notifications,
+    addEvent,
+    updateEvent,
+    addCollaborator,
+    addCostume,
+    addMaterial,
+    setAvailability,
+    addAssignment,
+  }), [currentUser, users, events, collaborators, costumes, materials, availability, assignments, notifications]);
+
+  if (isLoading) {
+    return <div className="flex items-center justify-center min-h-screen">Caricamento...</div>;
+  }
+
+  return <DemoContext.Provider value={value}>{children}</DemoContext.Provider>;
+}
