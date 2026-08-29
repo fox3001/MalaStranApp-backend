@@ -1,0 +1,12 @@
+{
+  "name": "malastran-app",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-01-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "malastran_db",
+      "database_id": ""
+    }
+  ]
+}
