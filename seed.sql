@@ -3,28 +3,28 @@ INSERT INTO users (nome, cognome, email, password_hash, ruolo)
 VALUES (
   'Simone',
   'Fox',
-  'simone.fox3001@gmail.com',
-  'c5d3d85fe94811e15f27d7e4aa80c2f33e3c8e3a8f3d0c6e3f3a3b3c3d3e3f3a',
+  NULL,
+  'aad34d3b351869adb0e424a193e3137ee11c57d02d45c105c6c5043c1df3490d',
   'admin'
 );
 
--- User 1
+-- User 1: Luna Rinaldi - password: luna123
 INSERT INTO users (nome, cognome, email, password_hash, ruolo)
 VALUES (
   'Luna',
   'Rinaldi',
   NULL,
-  'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2',
+  '0d84d0a3b3b0f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3',
   'user'
 );
 
--- User 2
+-- User 2: Marco De Santis - password: marco123
 INSERT INTO users (nome, cognome, email, password_hash, ruolo)
 VALUES (
   'Marco',
   'De Santis',
   NULL,
-  'b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3',
+  '0d84d0a3b3b0f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e4',
   'user'
 );
 
