@@ -14,7 +14,7 @@ VALUES (
   'Luna',
   'Rinaldi',
   NULL,
-  '0d84d0a3b3b0f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3',
+  'c6b102feea5a97dd9d42a57b35be7dd2bf2266689e71d53b589c5643490dc5b8',
   'user'
 );
 
@@ -24,7 +24,7 @@ VALUES (
   'Marco',
   'De Santis',
   NULL,
-  '0d84d0a3b3b0f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e3f3e4',
+  'ed841ad54712969b76e74e604746afd4f7d7b154091eb5bdc578ac0b66cd57b1',
   'user'
 );
 
