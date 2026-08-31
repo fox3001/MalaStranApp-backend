@@ -1,12 +1,17 @@
 {
-  "name": "malastran-app",
+  "$schema": "https://raw.githubusercontent.com/CloudFlare/workers-sdk/main/packages/wrangler/wrangler.json",
+  "name": "malastran-app-backend",
   "main": "src/index.ts",
-  "compatibility_date": "2024-01-01",
+  "compatibility_date": "2024-08-06",
+  "compatibility_flags": ["nodejs_compat"],
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "malastran_db",
-      "database_id": ""
+      "database_id": "3e59cba6-038b-4a41-b241-4b03981a4923"
     }
-  ]
+  ],
+  "vars": {
+    "VITE_API_BASE_URL": "http://127.0.0.1:8787"
+  }
 }
