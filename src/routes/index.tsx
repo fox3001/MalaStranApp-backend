@@ -1,6 +1,14 @@
 import { useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
+import { Route as RootRoute } from './__root';
+import { createRoute } from '@tanstack/react-router';
 import { api } from '../lib/api';
+
+export const Route = createRoute({
+  getParentRoute: () => RootRoute,
+  path: '/',
+  component: LoginPage,
+});
 
 export default function LoginPage() {
   const [isAdmin, setIsAdmin] = useState(false);
