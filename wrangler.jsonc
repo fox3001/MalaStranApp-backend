@@ -10,5 +10,8 @@
       "database_name": "malastrana_db",
       "database_id": "3e59cba6-038b-4a41-b241-4b03981a4923"
     }
-  ]
+  ],
+  "vars": {
+    "ADMIN_PASSWORD": "admin"
+  }
 }
