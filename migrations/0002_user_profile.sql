@@ -1,0 +1,4 @@
+ALTER TABLE users ADD COLUMN telefono TEXT;
+ALTER TABLE users ADD COLUMN bio TEXT;
+ALTER TABLE users ADD COLUMN competenze_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE users ADD COLUMN competenze_flag_json TEXT NOT NULL DEFAULT '[]';
