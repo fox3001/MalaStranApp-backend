@@ -1,70 +1,28 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 
-const app = new Hono();
-
-app.use("*", cors());
-
-// Login route
-app.post("/api/login", async (c) => {
-  const body = await c.req.json();
-  const { mode, password, nomeCognome } = body;
-
-  // Admin: solo password
-  if (mode === "admin") {
-    if (password === "admin") {
-      return c.json({
-        success: true,
-        user: {
-          id: "admin",
-          nome: "Admin",
-          cognome: "",
-          role: "admin",
-        },
-      });
-    }
-    return c.json(
-      { success: false, error: "Password non valida" },
-      { status: 401 }
-    );
-  }
-
-  // User: nomeCognome + password
-  if (mode === "user" && nomeCognome && password) {
-    const parts = nomeCognome.trim().split(/\s+/);
-    if (parts.length < 2) {
-      return c.json(
-        { success: false, error: "Inserisci nome e cognome" },
-        { status: 400 }
-      );
-    }
-    const nome = parts[0];
-    const cognome = parts.slice(1).join(" ");
-
-    const users = await c.env.DB.prepare(
-      "SELECT * FROM users WHERE nome = ? AND cognome = ? AND password = ?"
-    )
-      .bind(nome, cognome, password)
-      .all();
-
-    if (users.results.length > 0) {
-      const user = users.results[0] as any;
-      return c.json({
-        success: true,
-        user: {
-          id: user.id,
-          nome: user.nome,
-          cognome: user.cognome,
-          role: user.role || "user",
-        },
-      });
-    }
-  }
-
-  return c.json(
-    { success: false, error: "Credenziali non valide" },
-    { status: 401 }
-  );
-});
-
+type Env = { Bindings: { DB: D1Database; ADMIN_PASSWORD?: string } };
+type SessionUser = { id: number | "admin"; nome: string; cognome: string; username: string; role: "admin" | "user" };
+const app = new Hono<Env>();
+const encoder = new TextEncoder();
+app.use("*", cors({ origin: "*", allowHeaders: ["Content-Type", "Authorization"] }));
+function bytesToHex(bytes: Uint8Array): string { return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""); }
+function hexToBytes(hex: string): Uint8Array { const bytes = new Uint8Array(hex.length / 2); for (let i = 0; i < bytes.length; i += 1) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16); return bytes; }
+function normalizePart(value: string): string { return value.trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9]+/g, "").toLowerCase(); }
+function makeUsername(nome: string, cognome: string): string { return `${normalizePart(nome)}.${normalizePart(cognome)}`; }
+async function hashPassword(password: string, saltHex?: string): Promise<string> { const iterations = 120000; const salt = saltHex ? hexToBytes(saltHex) : crypto.getRandomValues(new Uint8Array(16)); const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]); const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations }, key, 256); return `pbkdf2$${iterations}$${bytesToHex(salt)}$${bytesToHex(new Uint8Array(bits))}`; }
+async function verifyPassword(password: string, stored: string): Promise<boolean> { const [scheme, iterationsText, saltHex, hashHex] = stored.split("$"); if (scheme !== "pbkdf2" || !iterationsText || !saltHex || !hashHex) return false; const iterations = Number(iterationsText); if (!Number.isInteger(iterations) || iterations < 10000) return false; const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]); const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: hexToBytes(saltHex), iterations }, key, 256); const actual = new Uint8Array(bits); const expected = hexToBytes(hashHex); if (actual.byteLength !== expected.byteLength) return false; let diff = 0; for (let i = 0; i < actual.length; i += 1) diff |= actual[i] ^ expected[i]; return diff === 0; }
+async function hashToken(token: string): Promise<string> { const digest = await crypto.subtle.digest("SHA-256", encoder.encode(token)); return bytesToHex(new Uint8Array(digest)); }
+function getBearerToken(c: any): string | null { const value = c.req.header("Authorization"); if (!value?.startsWith("Bearer ")) return null; return value.slice(7).trim() || null; }
+async function createSession(db: D1Database, user: SessionUser): Promise<string> { const token = bytesToHex(crypto.getRandomValues(new Uint8Array(32))); const tokenHash = await hashToken(token); const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); await db.prepare("INSERT INTO sessions (id, user_id, role, token_hash, expires_at) VALUES (?, ?, ?, ?, ?)").bind(crypto.randomUUID(), user.id === "admin" ? null : user.id, user.role, tokenHash, expiresAt).run(); return token; }
+async function getSessionUser(db: D1Database, token: string): Promise<SessionUser | null> { const row = await db.prepare(`SELECT s.role, s.user_id, s.expires_at, u.nome, u.cognome, u.username FROM sessions s LEFT JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`).bind(await hashToken(token)).first<{ role: "admin" | "user"; user_id: number | null; expires_at: string; nome: string | null; cognome: string | null; username: string | null }>(); if (!row || new Date(row.expires_at).getTime() <= Date.now()) return null; if (row.role === "admin") return { id: "admin", nome: "Admin", cognome: "", username: "admin", role: "admin" }; if (row.user_id == null || !row.nome || !row.cognome || !row.username) return null; return { id: row.user_id, nome: row.nome, cognome: row.cognome, username: row.username, role: "user" }; }
+async function requireAdmin(c: any): Promise<SessionUser | Response> { const token = getBearerToken(c); if (!token) return c.json({ success: false, error: "Autenticazione richiesta" }, 401); const user = await getSessionUser(c.env.DB, token); if (!user || user.role !== "admin") return c.json({ success: false, error: "Accesso amministratore richiesto" }, 403); return user; }
+app.get("/api/health", (c) => c.json({ ok: true, service: "malastran-app-backend" }));
+app.post("/api/login", async (c) => { const body = await c.req.json<{ username?: string; password?: string }>(); const username = body.username?.trim().toLowerCase(); const password = body.password ?? ""; if (!username || !password) return c.json({ success: false, error: "Inserisci username e password" }, 400); if (username === "admin") { if (!c.env.ADMIN_PASSWORD) return c.json({ success: false, error: "ADMIN_PASSWORD non configurata sul backend" }, 500); if (password !== c.env.ADMIN_PASSWORD) return c.json({ success: false, error: "Credenziali non valide" }, 401); const user: SessionUser = { id: "admin", nome: "Admin", cognome: "", username: "admin", role: "admin" }; return c.json({ success: true, token: await createSession(c.env.DB, user), user }); } const row = await c.env.DB.prepare("SELECT id, nome, cognome, username, password_hash, ruolo FROM users WHERE lower(username) = ? LIMIT 1").bind(username).first<{ id: number; nome: string; cognome: string; username: string; password_hash: string; ruolo: "admin" | "user" }>(); if (!row || row.ruolo !== "user" || !(await verifyPassword(password, row.password_hash))) return c.json({ success: false, error: "Credenziali non valide" }, 401); const user: SessionUser = { id: row.id, nome: row.nome, cognome: row.cognome, username: row.username, role: "user" }; return c.json({ success: true, token: await createSession(c.env.DB, user), user }); });
+app.get("/api/me", async (c) => { const token = getBearerToken(c); if (!token) return c.json({ success: false, error: "Autenticazione richiesta" }, 401); const user = await getSessionUser(c.env.DB, token); if (!user) return c.json({ success: false, error: "Sessione non valida o scaduta" }, 401); return c.json({ success: true, user }); });
+app.post("/api/logout", async (c) => { const token = getBearerToken(c); if (token) await c.env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await hashToken(token)).run(); return c.json({ success: true }); });
+app.post("/api/admin/users", async (c) => { const admin = await requireAdmin(c); if (admin instanceof Response) return admin; const body = await c.req.json<{ nome?: string; cognome?: string; email?: string; password?: string }>(); const nome = body.nome?.trim(); const cognome = body.cognome?.trim(); const password = body.password?.trim() || cognome || ""; if (!nome || !cognome) return c.json({ success: false, error: "Nome e cognome sono obbligatori" }, 400); if (password.length < 3) return c.json({ success: false, error: "La password deve contenere almeno 3 caratteri" }, 400); const username = makeUsername(nome, cognome); if (!username || username === ".") return c.json({ success: false, error: "Impossibile generare lo username" }, 400); const existing = await c.env.DB.prepare("SELECT id FROM users WHERE lower(username) = ? LIMIT 1").bind(username).first(); if (existing) return c.json({ success: false, error: `Esiste già un collaboratore con username ${username}` }, 409); const passwordHash = await hashPassword(password); const result = await c.env.DB.prepare("INSERT INTO users (nome, cognome, username, email, password_hash, ruolo) VALUES (?, ?, ?, ?, ?, 'user')").bind(nome, cognome, username, body.email?.trim() || null, passwordHash).run(); return c.json({ success: true, user: { id: result.meta.last_row_id, nome, cognome, username, email: body.email?.trim() || null, role: "user" } }, 201); });
+app.get("/api/admin/users", async (c) => { const admin = await requireAdmin(c); if (admin instanceof Response) return admin; const users = await c.env.DB.prepare("SELECT id, nome, cognome, username, email, ruolo, created_at FROM users WHERE ruolo = 'user' ORDER BY cognome, nome").all(); return c.json({ success: true, users: users.results }); });
+app.get("/api/admin/users/:id", async (c) => { const admin = await requireAdmin(c); if (admin instanceof Response) return admin; const id = Number(c.req.param("id")); if (!Number.isInteger(id)) return c.json({ success: false, error: "ID non valido" }, 400); const user = await c.env.DB.prepare("SELECT id, nome, cognome, username, email, ruolo, created_at FROM users WHERE id = ?").bind(id).first(); if (!user) return c.json({ success: false, error: "Collaboratore non trovato" }, 404); return c.json({ success: true, user }); });
+app.patch("/api/admin/users/:id/password", async (c) => { const admin = await requireAdmin(c); if (admin instanceof Response) return admin; const id = Number(c.req.param("id")); const body = await c.req.json<{ password?: string }>(); const password = body.password?.trim() ?? ""; if (!Number.isInteger(id) || password.length < 3) return c.json({ success: false, error: "ID o password non validi" }, 400); const result = await c.env.DB.prepare("UPDATE users SET password_hash = ? WHERE id = ? AND ruolo = 'user'").bind(await hashPassword(password), id).run(); if (!result.meta.changes) return c.json({ success: false, error: "Collaboratore non trovato" }, 404); return c.json({ success: true }); });
 export default app;
