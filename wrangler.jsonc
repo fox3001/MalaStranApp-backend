@@ -7,11 +7,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "malastran_db",
+      "database_name": "malastrana_db",
       "database_id": "3e59cba6-038b-4a41-b241-4b03981a4923"
     }
-  ],
-  "vars": {
-    "VITE_API_BASE_URL": "http://127.0.0.1:8787"
-  }
+  ]
 }
