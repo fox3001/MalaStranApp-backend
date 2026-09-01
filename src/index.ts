@@ -70,7 +70,10 @@ async function verifyPassword(password: string, stored: string): Promise<boolean
   );
   const actual = new Uint8Array(bits);
   const expected = hexToBytes(hashHex);
-  return actual.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(actual, expected);
+  if (actual.byteLength !== expected.byteLength) return false;
+  let diff = 0;
+  for (let i = 0; i < actual.length; i += 1) diff |= actual[i] ^ expected[i];
+  return diff === 0;
 }
 
 async function hashToken(token: string): Promise<string> {
