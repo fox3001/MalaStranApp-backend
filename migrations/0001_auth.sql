@@ -1,9 +1,13 @@
--- Authentication foundation for the real application.
--- Run this migration against the D1 database before deploying the new Worker.
-
-ALTER TABLE users ADD COLUMN username TEXT;
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  nome TEXT NOT NULL,
+  cognome TEXT NOT NULL,
+  username TEXT NOT NULL UNIQUE,
+  email TEXT,
+  password_hash TEXT NOT NULL,
+  ruolo TEXT NOT NULL CHECK (ruolo IN ('admin', 'user')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
@@ -11,7 +15,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
   token_hash TEXT NOT NULL UNIQUE,
   expires_at TEXT NOT NULL,
-  created_at TEXT DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
