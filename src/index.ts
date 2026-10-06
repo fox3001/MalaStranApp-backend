@@ -217,6 +217,9 @@ const PARTICIPANT_STATES = ["pending", "available", "unavailable", "confirmed", 
 // ---------------------------------------------------------------------------
 
 async function notifyUser(db: D1Database, userId: number, type: string, message: string, eventId: number | null) {
+  // niente doppioni: se c'è già la stessa notifica non letta, non se ne crea un'altra
+  const same = await db.prepare("SELECT id FROM notifications WHERE user_id = ? AND message = ? AND is_read = 0 LIMIT 1").bind(userId, message).first();
+  if (same) return;
   await db.prepare("INSERT INTO notifications (user_id, for_admin, type, message, event_id) VALUES (?, 0, ?, ?, ?)").bind(userId, type, message, eventId).run();
 }
 async function notifyAdmin(db: D1Database, type: string, message: string, eventId: number | null) {
