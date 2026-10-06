@@ -5,7 +5,7 @@
 
 import { SEED_EVENT_CODE, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -138,13 +138,18 @@ const REQUIRED_MARKER: Record<string, string> = {
 
 // Colonne aggiunte nel tempo alla bolla di carico.
 // Colonne aggiunte nel tempo agli eventi.
-const EVENT_EXTRA_COLUMNS: Array<[string, string]> = [["note_finali", "TEXT"]];
+const EVENT_EXTRA_COLUMNS: Array<[string, string]> = [
+  ["note_finali", "TEXT"],
+  ["chiuso_da", "TEXT"],
+  ["chiuso_at", "TEXT"],
+];
 
 const LOAD_ROW_EXTRA_COLUMNS: Array<[string, string]> = [
   ["codice", "TEXT"],
   ["taglia", "TEXT"],
   ["note", "TEXT"],
   ["prep", "INTEGER NOT NULL DEFAULT 0"],
+  ["annotazione", "TEXT"],
 ];
 
 const OLD_TABLES = ["availability_requests", "assignments", "tl_assignments"];

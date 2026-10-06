@@ -183,6 +183,8 @@ function eventFromRow(row: Record<string, unknown>) {
     compenso_visibile: row.compenso_visibile === 1,
     note_admin: (row.note_admin as string | null) ?? "",
     note_finali: (row.note_finali as string | null) ?? "",
+    chiuso_da: (row.chiuso_da as string | null) ?? "",
+    chiuso_at: (row.chiuso_at as string | null) ?? "",
     stato: row.stato as string,
     motivo_annullamento: (row.motivo_annullamento as string | null) ?? "",
     created_at: row.created_at as string,
@@ -205,6 +207,7 @@ function loadRowFromRow(row: Record<string, unknown>) {
     returned: row.returned === 1,
     damaged: row.damaged === 1,
     prep: row.prep === 1,
+    annotazione: (row.annotazione as string | null) ?? "",
     note: (row.note as string | null) ?? "",
     comment: (row.comment as string | null) ?? "",
     updated_by: (row.updated_by as string | null) ?? "",
@@ -657,6 +660,8 @@ app.patch("/api/admin/events/:code", async (c) => {
     if (typeof b.stato !== "string" || !EVENT_STATES.includes(b.stato)) return fail(c, 400, "Stato evento non valido");
     sets.push("stato = ?");
     vals.push(b.stato);
+    if (b.stato === "chiuso" && event.stato !== "chiuso") sets.push("chiuso_da = 'Admin'", "chiuso_at = datetime('now')");
+    if (b.stato !== "chiuso") sets.push("chiuso_da = NULL", "chiuso_at = NULL");
   }
   if (!sets.length) return c.json({ success: true, event });
   sets.push("updated_at = datetime('now')");
@@ -796,6 +801,7 @@ app.post("/api/admin/events/:code/load-rows/assign", async (c) => {
 app.post("/api/admin/events/:code/load-rows", async (c) => {
   const ev = await eventByCode(c.env.DB, c.req.param("code"));
   if (!ev) return fail(c, 404, "Evento non trovato");
+  if (ev.stato === "chiuso") return fail(c, 409, "Evento chiuso: sulla bolla puoi solo aggiungere annotazioni");
   const b = await body(c);
   const list = Array.isArray(b.rows) ? (b.rows as Record<string, unknown>[]) : [b];
   const valid = list.slice(0, 500).map(loadRowValues).filter((v) => v.item);
@@ -811,11 +817,21 @@ app.post("/api/admin/events/:code/load-rows", async (c) => {
 app.patch("/api/admin/load-rows/:rid", async (c) => {
   const rid = intParam(c, "rid");
   if (!rid) return fail(c, 400, "ID non valido");
-  const row = await c.env.DB.prepare("SELECT l.*, e.nome AS event_nome FROM load_rows l JOIN events e ON e.id = l.event_id WHERE l.id = ?").bind(rid).first();
+  const row = await c.env.DB.prepare("SELECT l.*, e.nome AS event_nome, e.stato AS event_stato FROM load_rows l JOIN events e ON e.id = l.event_id WHERE l.id = ?").bind(rid).first();
   if (!row) return fail(c, 404, "Riga non trovata");
   const b = await body(c);
   const sets: string[] = [];
   const vals: unknown[] = [];
+  if (b.annotazione !== undefined) {
+    sets.push("annotazione = ?");
+    vals.push(str(b.annotazione, 1000));
+  }
+  if (row.event_stato === "chiuso") {
+    const other = Object.keys(b).filter((k) => k !== "annotazione");
+    if (other.length) return fail(c, 409, "Evento chiuso: sulla bolla puoi solo aggiungere annotazioni");
+    if (sets.length) await c.env.DB.prepare(`UPDATE load_rows SET ${sets.join(", ")} WHERE id = ?`).bind(...vals, rid).run();
+    return c.json({ success: true });
+  }
   for (const f of ["item", "categoria", "codice", "taglia", "comment", "note"] as const) {
     if (b[f] === undefined) continue;
     const v = str(b[f], f === "comment" ? 1000 : f === "note" ? 300 : 160);
@@ -849,7 +865,45 @@ app.patch("/api/admin/load-rows/:rid", async (c) => {
 app.delete("/api/admin/load-rows/:rid", async (c) => {
   const rid = intParam(c, "rid");
   if (!rid) return fail(c, 400, "ID non valido");
+  const st = await c.env.DB.prepare("SELECT e.stato FROM load_rows l JOIN events e ON e.id = l.event_id WHERE l.id = ?").bind(rid).first<{ stato: string }>();
+  if (st?.stato === "chiuso") return fail(c, 409, "Evento chiuso: la bolla non si può più modificare");
   await c.env.DB.prepare("DELETE FROM load_rows WHERE id = ?").bind(rid).run();
+  return c.json({ success: true });
+});
+
+// Chiusura evento (admin o team leader). Dopo la chiusura modifica solo l'admin, fino all'archiviazione.
+async function closeEvent(db: D1Database, eventId: number, by: string) {
+  await db
+    .prepare("UPDATE events SET stato = 'chiuso', chiuso_da = ?, chiuso_at = datetime('now'), updated_at = datetime('now') WHERE id = ?")
+    .bind(by, eventId)
+    .run();
+}
+
+app.post("/api/admin/events/:code/chiudi", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  if (!ev) return fail(c, 404, "Evento non trovato");
+  if (ev.stato === "chiuso") return fail(c, 409, "L'evento è già chiuso");
+  await closeEvent(c.env.DB, ev.id as number, "Admin");
+  return c.json({ success: true });
+});
+
+app.post("/api/admin/events/:code/riapri", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  if (!ev) return fail(c, 404, "Evento non trovato");
+  await c.env.DB.prepare("UPDATE events SET stato = 'confermato', chiuso_da = NULL, chiuso_at = NULL, updated_at = datetime('now') WHERE id = ?").bind(ev.id).run();
+  return c.json({ success: true });
+});
+
+app.post("/api/my/events/:code/chiudi", async (c) => {
+  const me = c.get("me");
+  const row = await myParticipation(c, c.req.param("code"));
+  if (!row) return fail(c, 404, "Evento non trovato o non sei coinvolto");
+  if (row.is_tl !== 1 || row.mio_stato === "unavailable" || row.mio_stato === "rejected") return fail(c, 403, "Solo il team leader può chiudere l'evento");
+  if (row.stato === "chiuso") return fail(c, 409, "L'evento è già chiuso");
+  if (row.stato === "annullato") return fail(c, 409, "L'evento è annullato");
+  const who = `${me.nome} ${me.cognome}`.trim();
+  await closeEvent(c.env.DB, row.id as number, `${who} (team leader)`);
+  await notifyAdmin(c.env.DB, "chiuso", `${who} ha chiuso l'evento ${row.nome as string}`, row.id as number);
   return c.json({ success: true });
 });
 
@@ -992,6 +1046,7 @@ app.patch("/api/my/load-rows/:rid", async (c) => {
     .first();
   if (!row) return fail(c, 404, "Riga non trovata");
   if (row.is_tl !== 1 || row.mio_stato === "unavailable" || row.mio_stato === "rejected") return fail(c, 403, "La bolla la compila solo il team leader dell'evento");
+  if (row.event_stato === "chiuso" || row.event_stato === "annullato") return fail(c, 409, "Evento chiuso: la bolla ora la può annotare solo l'admin");
   const b = await body(c);
   const sets: string[] = [];
   const vals: unknown[] = [];
@@ -1111,7 +1166,7 @@ async function buildResoconto(db: D1Database, eventId: number) {
       non_rientrati: rows.filter((r) => r.present && !r.returned).length,
     },
   };
-  const problemi = rows.filter((r) => r.damaged || r.comment || (r.present && !r.returned));
+  const problemi = rows.filter((r) => r.damaged || r.comment || r.annotazione || (r.present && !r.returned));
 
   const L: string[] = [];
   const line = (s = "") => L.push(s);
@@ -1127,6 +1182,7 @@ async function buildResoconto(db: D1Database, eventId: number) {
   if (event.note_admin) line(`Note interne: ${event.note_admin}`);
   if (event.motivo_annullamento) line(`Motivo annullamento: ${event.motivo_annullamento}`);
   line();
+  if (event.chiuso_at) line(`Evento chiuso da ${event.chiuso_da || "-"} il ${event.chiuso_at}`);
   line(`COME È ANDATA (note finali): ${event.note_finali || "-"}`);
   line();
   const sp = summary.persone;
@@ -1139,7 +1195,7 @@ async function buildResoconto(db: D1Database, eventId: number) {
   line(`BOLLA DI CARICO — voci ${sb.oggetti}, entrate ${sb.presenti}, uscite ${sb.rientrati}, danneggiate ${sb.danneggiati}, entrate ma non uscite ${sb.non_rientrati}`);
   for (const r of rows) {
     const flags = [r.prep ? "prep" : "NO prep", r.present ? "entrata" : "NO entrata", r.returned ? "uscita" : "NO uscita", r.damaged ? "DANNEGGIATO" : ""].filter(Boolean).join(", ");
-    line(`  - [${r.categoria || "-"}] ${r.quantita > 1 ? `${r.quantita}x ` : ""}${r.item}${r.codice ? ` (${r.codice})` : ""}${r.taglia ? ` tg ${r.taglia}` : ""}${r.note ? ` {${r.note}}` : ""}: ${flags}${r.comment ? ` — "${r.comment}"` : ""}`);
+    line(`  - [${r.categoria || "-"}] ${r.quantita > 1 ? `${r.quantita}x ` : ""}${r.item}${r.codice ? ` (${r.codice})` : ""}${r.taglia ? ` tg ${r.taglia}` : ""}${r.note ? ` {${r.note}}` : ""}: ${flags}${r.comment ? ` — "${r.comment}"` : ""}${r.annotazione ? ` — ANNOTAZIONE ADMIN: ${r.annotazione}` : ""}`);
   }
   line();
   return { event, summary, people, problemi, testo: L.join("\n") };
