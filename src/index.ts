@@ -1,30 +1,234 @@
-import { Hono } from "hono";
+// MalaStranApp – backend (Cloudflare Worker + Hono + D1)
+//
+// Regole principali:
+// - c'è un solo admin (password nella variabile ADMIN_PASSWORD);
+// - gli user li crea solo l'admin, che sceglie username e password;
+// - ogni controllo dei permessi avviene qui nel backend, non solo nelle pagine.
+
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { ensureSchema, schemaStatus } from "./schema";
 
-type Env = { Bindings: { DB: D1Database; ADMIN_PASSWORD?: string } };
+type Bindings = { DB: D1Database; ADMIN_PASSWORD?: string };
 type SessionUser = { id: number | "admin"; nome: string; cognome: string; username: string; role: "admin" | "user" };
-type ProfileBody = { email?: string; telefono?: string; phone?: string; bio?: string; competenze?: string[]; competenzeFlag?: string[]; skills?: string[]; costumeFlags?: string[] };
+type Env = { Bindings: Bindings; Variables: { me: SessionUser } };
+type C = Context<Env>;
+
 const app = new Hono<Env>();
 const encoder = new TextEncoder();
-const SKILLS = ["Attore", "Rievocatore", "Animatore", "Cavaliere", "Cosplayer", "Giocoliere", "Public speaking", "Gestione pubblico", "Gestione bimbimerda"];
-const COSTUMES = ["Potter base", "Medievale base", "Personale 1", "Personale 2"];
-function bytesToHex(bytes: Uint8Array): string { return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""); }
-function hexToBytes(hex: string): Uint8Array { const bytes = new Uint8Array(hex.length / 2); for (let i = 0; i < bytes.length; i += 1) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16); return bytes; }
-function normalizePart(value: string): string { return value.trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9]+/g, "").toLowerCase(); }
-function makeUsername(nome: string, cognome: string): string { return `${normalizePart(nome)}.${normalizePart(cognome)}`; }
-async function hashPassword(password: string, saltHex?: string): Promise<string> { const iterations = 100000; /* massimo consentito da Cloudflare Workers */ const salt = saltHex ? hexToBytes(saltHex) : crypto.getRandomValues(new Uint8Array(16)); const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]); const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations }, key, 256); return `pbkdf2$${iterations}$${bytesToHex(salt)}$${bytesToHex(new Uint8Array(bits))}`; }
-async function verifyPassword(password: string, stored: string): Promise<boolean> { const [scheme, iterationsText, saltHex, hashHex] = stored.split("$"); if (scheme !== "pbkdf2" || !iterationsText || !saltHex || !hashHex) return false; const iterations = Number(iterationsText); if (!Number.isInteger(iterations) || iterations < 10000) return false; const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]); const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: hexToBytes(saltHex), iterations }, key, 256); const actual = new Uint8Array(bits); const expected = hexToBytes(hashHex); if (actual.byteLength !== expected.byteLength) return false; let diff = 0; for (let i = 0; i < actual.length; i += 1) diff |= actual[i] ^ expected[i]; return diff === 0; }
-async function hashToken(token: string): Promise<string> { const digest = await crypto.subtle.digest("SHA-256", encoder.encode(token)); return bytesToHex(new Uint8Array(digest)); }
-function getBearerToken(c: any): string | null { const value = c.req.header("Authorization"); if (!value?.startsWith("Bearer ")) return null; return value.slice(7).trim() || null; }
-function jsonArray(value: unknown): string[] { if (!Array.isArray(value)) return []; return value.filter((v): v is string => typeof v === "string"); }
-function profileFromRow(row: any): { telefono: string; phone: string; bio: string; skills: string[]; competenze: string[]; costumeFlags: string[]; competenzeFlag: string[] } { return { telefono: row.telefono || "", phone: row.telefono || "", bio: row.bio || "", skills: JSON.parse(row.competenze_json || "[]"), competenze: JSON.parse(row.competenze_json || "[]"), costumeFlags: JSON.parse(row.competenze_flag_json || "[]"), competenzeFlag: JSON.parse(row.competenze_flag_json || "[]") }; }
-function userFromRow(row: any) { return { id: row.id, nome: row.nome, cognome: row.cognome, username: row.username, email: row.email ?? null, ruolo: row.ruolo, role: row.ruolo, created_at: row.created_at, ...profileFromRow(row) }; }
-async function createSession(db: D1Database, user: SessionUser): Promise<string> { const token = bytesToHex(crypto.getRandomValues(new Uint8Array(32))); const tokenHash = await hashToken(token); const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); await db.prepare("INSERT INTO sessions (id, user_id, role, token_hash, expires_at) VALUES (?, ?, ?, ?, ?)").bind(crypto.randomUUID(), user.id === "admin" ? null : user.id, user.role, tokenHash, expiresAt).run(); return token; }
-async function getSessionUser(db: D1Database, token: string): Promise<SessionUser | null> { const row = await db.prepare(`SELECT s.role, s.user_id, s.expires_at, u.nome, u.cognome, u.username FROM sessions s LEFT JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`).bind(await hashToken(token)).first<{ role: "admin" | "user"; user_id: number | null; expires_at: string; nome: string | null; cognome: string | null; username: string | null }>(); if (!row || new Date(row.expires_at).getTime() <= Date.now()) return null; if (row.role === "admin") return { id: "admin", nome: "Admin", cognome: "", username: "admin", role: "admin" }; if (row.user_id == null || !row.nome || !row.cognome || !row.username) return null; return { id: row.user_id, nome: row.nome, cognome: row.cognome, username: row.username, role: "user" }; }
-async function requireAdmin(c: any): Promise<SessionUser | Response> { const token = getBearerToken(c); if (!token) return c.json({ success: false, error: "Autenticazione richiesta" }, 401); const user = await getSessionUser(c.env.DB, token); if (!user || user.role !== "admin") return c.json({ success: false, error: "Accesso amministratore richiesto" }, 403); return user; }
-async function requireUser(c: any): Promise<SessionUser | Response> { const token = getBearerToken(c); if (!token) return c.json({ success: false, error: "Autenticazione richiesta" }, 401); const user = await getSessionUser(c.env.DB, token); if (!user || user.role !== "user") return c.json({ success: false, error: "Accesso collaboratore richiesto" }, 403); return user; }
+
+// ---------------------------------------------------------------------------
+// Utilità
+// ---------------------------------------------------------------------------
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i += 1) out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+function normalizePart(value: string): string {
+  return value.trim().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-zA-Z0-9]+/g, "").toLowerCase();
+}
+function str(value: unknown, max = 2000): string | null {
+  if (typeof value !== "string") return null;
+  const v = value.trim();
+  return v ? v.slice(0, max) : null;
+}
+function bool(value: unknown): number {
+  return value === true || value === 1 || value === "1" || value === "true" ? 1 : 0;
+}
+function tagList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const v of value) {
+    if (typeof v !== "string") continue;
+    const t = v.trim().slice(0, 40);
+    if (!t || seen.has(t.toLowerCase())) continue;
+    seen.add(t.toLowerCase());
+    out.push(t);
+    if (out.length >= 60) break;
+  }
+  return out;
+}
+function parseJsonArray(value: unknown): string[] {
+  try {
+    const parsed = JSON.parse(typeof value === "string" ? value : "[]");
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+  } catch {
+    return [];
+  }
+}
+function fail(c: C, status: 400 | 401 | 403 | 404 | 409 | 500, error: string) {
+  return c.json({ success: false, error }, status);
+}
+async function body<T = Record<string, unknown>>(c: C): Promise<T> {
+  try {
+    return (await c.req.json()) as T;
+  } catch {
+    return {} as T;
+  }
+}
+function intParam(c: C, name: string): number | null {
+  const n = Number(c.req.param(name));
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+// ---------------------------------------------------------------------------
+// Password e sessioni
+// ---------------------------------------------------------------------------
+
+const PBKDF2_ITERATIONS = 100000; // massimo consentito da Cloudflare Workers
+
+async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: PBKDF2_ITERATIONS }, key, 256);
+  return `pbkdf2$${PBKDF2_ITERATIONS}$${bytesToHex(salt)}$${bytesToHex(new Uint8Array(bits))}`;
+}
+async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  const [scheme, iterText, saltHex, hashHex] = stored.split("$");
+  if (scheme !== "pbkdf2" || !iterText || !saltHex || !hashHex) return false;
+  const iterations = Number(iterText);
+  if (!Number.isInteger(iterations) || iterations < 10000 || iterations > 100000) return false;
+  const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: hexToBytes(saltHex), iterations }, key, 256));
+  const expected = hexToBytes(hashHex);
+  if (bits.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < bits.length; i += 1) diff |= (bits[i] ?? 0) ^ (expected[i] ?? 0);
+  return diff === 0;
+}
+async function hashToken(token: string): Promise<string> {
+  return bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(token))));
+}
+const SESSION_DAYS = 30;
+async function createSession(db: D1Database, user: SessionUser): Promise<string> {
+  const token = bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
+  const expiresAt = new Date(Date.now() + SESSION_DAYS * 86400000).toISOString();
+  await db
+    .prepare("INSERT INTO sessions (id, user_id, role, token_hash, expires_at) VALUES (?, ?, ?, ?, ?)")
+    .bind(crypto.randomUUID(), user.id === "admin" ? null : user.id, user.role, await hashToken(token), expiresAt)
+    .run();
+  // pulizia delle sessioni scadute
+  await db.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(new Date().toISOString()).run();
+  return token;
+}
+async function sessionFromRequest(c: C): Promise<SessionUser | null> {
+  const header = c.req.header("Authorization");
+  if (!header?.startsWith("Bearer ")) return null;
+  const token = header.slice(7).trim();
+  if (!token) return null;
+  const row = await c.env.DB
+    .prepare(
+      `SELECT s.role, s.user_id, s.expires_at, u.nome, u.cognome, u.username, u.attivo
+       FROM sessions s LEFT JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`,
+    )
+    .bind(await hashToken(token))
+    .first<{ role: "admin" | "user"; user_id: number | null; expires_at: string; nome: string | null; cognome: string | null; username: string | null; attivo: number | null }>();
+  if (!row || new Date(row.expires_at).getTime() <= Date.now()) return null;
+  if (row.role === "admin") return { id: "admin", nome: "Admin", cognome: "", username: "admin", role: "admin" };
+  if (row.user_id == null || !row.username || row.attivo === 0) return null;
+  return { id: row.user_id, nome: row.nome ?? "", cognome: row.cognome ?? "", username: row.username, role: "user" };
+}
+
+// ---------------------------------------------------------------------------
+// Forme dei dati restituiti alle pagine
+// ---------------------------------------------------------------------------
+
+const USER_COLUMNS =
+  "id, nome, cognome, username, email, ruolo, created_at, telefono, bio, note, qualifica, attivo, competenze_json, competenze_flag_json";
+
+function userFromRow(row: Record<string, unknown>) {
+  const competenze = parseJsonArray(row.competenze_json);
+  const flag = parseJsonArray(row.competenze_flag_json);
+  return {
+    id: row.id as number,
+    nome: row.nome as string,
+    cognome: row.cognome as string,
+    username: row.username as string,
+    email: (row.email as string | null) ?? "",
+    telefono: (row.telefono as string | null) ?? "",
+    bio: (row.bio as string | null) ?? "",
+    note: (row.note as string | null) ?? "",
+    qualifica: (row.qualifica as string | null) ?? "",
+    attivo: row.attivo !== 0,
+    role: "user" as const,
+    ruolo: "user" as const,
+    competenze,
+    competenzeFlag: flag,
+    created_at: row.created_at as string,
+  };
+}
+
+function eventFromRow(row: Record<string, unknown>) {
+  return {
+    id: row.id as number,
+    code: row.code as string,
+    nome: row.nome as string,
+    data: row.data as string,
+    ora_ritrovo: (row.ora_ritrovo as string | null) ?? "",
+    ora_inizio: (row.ora_inizio as string | null) ?? "",
+    ora_fine: (row.ora_fine as string | null) ?? "",
+    luogo: (row.luogo as string | null) ?? "",
+    tipo: (row.tipo as string | null) ?? "",
+    descrizione: (row.descrizione as string | null) ?? "",
+    info_operative: (row.info_operative as string | null) ?? "",
+    referente_nome: (row.referente_nome as string | null) ?? "",
+    referente_telefono: (row.referente_telefono as string | null) ?? "",
+    compenso: (row.compenso as string | null) ?? "",
+    compenso_visibile: row.compenso_visibile === 1,
+    note_admin: (row.note_admin as string | null) ?? "",
+    stato: row.stato as string,
+    motivo_annullamento: (row.motivo_annullamento as string | null) ?? "",
+    created_at: row.created_at as string,
+    updated_at: row.updated_at as string,
+  };
+}
+
+function loadRowFromRow(row: Record<string, unknown>) {
+  return {
+    id: row.id as number,
+    event_id: row.event_id as number,
+    item: row.item as string,
+    categoria: (row.categoria as string | null) ?? "",
+    codice: (row.codice as string | null) ?? "",
+    taglia: (row.taglia as string | null) ?? "",
+    quantita: row.quantita as number,
+    assigned_user_id: (row.assigned_user_id as number | null) ?? null,
+    assigned_name: row.assigned_nome ? `${row.assigned_nome as string} ${row.assigned_cognome as string}` : "",
+    present: row.present === 1,
+    returned: row.returned === 1,
+    damaged: row.damaged === 1,
+    comment: (row.comment as string | null) ?? "",
+    updated_by: (row.updated_by as string | null) ?? "",
+    updated_at: row.updated_at as string,
+  };
+}
+
+const EVENT_STATES = ["richiesta", "da_definire", "confermato", "annullato", "chiuso"];
+const PARTICIPANT_STATES = ["pending", "available", "unavailable", "confirmed", "rejected"];
+
+// ---------------------------------------------------------------------------
+// Notifiche
+// ---------------------------------------------------------------------------
+
+async function notifyUser(db: D1Database, userId: number, type: string, message: string, eventId: number | null) {
+  await db.prepare("INSERT INTO notifications (user_id, for_admin, type, message, event_id) VALUES (?, 0, ?, ?, ?)").bind(userId, type, message, eventId).run();
+}
+async function notifyAdmin(db: D1Database, type: string, message: string, eventId: number | null) {
+  await db.prepare("INSERT INTO notifications (user_id, for_admin, type, message, event_id) VALUES (NULL, 1, ?, ?, ?)").bind(type, message, eventId).run();
+}
+
+// ---------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------
+
 app.use("/api/*", cors());
+
 app.get("/api/health", async (c) => {
   try {
     await ensureSchema(c.env.DB);
@@ -33,28 +237,790 @@ app.get("/api/health", async (c) => {
     return c.json({ ok: false, service: "malastranapp-back", database: { ok: false, error: err instanceof Error ? err.message : String(err) } }, 500);
   }
 });
+
 app.use("/api/*", async (c, next) => {
   try {
     await ensureSchema(c.env.DB);
   } catch (err) {
     console.error("Errore preparazione database", err);
-    return c.json({ success: false, error: "Database non disponibile: " + (err instanceof Error ? err.message : String(err)) }, 500);
+    return fail(c, 500, "Database non disponibile: " + (err instanceof Error ? err.message : String(err)));
   }
   await next();
 });
+
+// Tutte le rotte /api/admin/* richiedono l'admin.
+app.use("/api/admin/*", async (c, next) => {
+  const me = await sessionFromRequest(c);
+  if (!me) return fail(c, 401, "Autenticazione richiesta");
+  if (me.role !== "admin") return fail(c, 403, "Accesso amministratore richiesto");
+  c.set("me", me);
+  await next();
+});
+
+// Le rotte /api/my/* e /api/profile* richiedono uno user.
+async function requireUser(c: C, next: () => Promise<void>) {
+  const me = await sessionFromRequest(c);
+  if (!me) return fail(c, 401, "Autenticazione richiesta");
+  if (me.role !== "user") return fail(c, 403, "Area riservata agli user");
+  c.set("me", me);
+  await next();
+}
+app.use("/api/my/*", requireUser);
+app.use("/api/profile", requireUser);
+app.use("/api/profile/*", requireUser);
+
+// Le notifiche servono a entrambi.
+app.use("/api/notifications", async (c, next) => {
+  const me = await sessionFromRequest(c);
+  if (!me) return fail(c, 401, "Autenticazione richiesta");
+  c.set("me", me);
+  await next();
+});
+app.use("/api/notifications/*", async (c, next) => {
+  const me = await sessionFromRequest(c);
+  if (!me) return fail(c, 401, "Autenticazione richiesta");
+  c.set("me", me);
+  await next();
+});
+
 app.onError((err, c) => {
   console.error(err);
   return c.json({ success: false, error: "Errore interno del server: " + (err instanceof Error ? err.message : String(err)) }, 500);
 });
-app.get("/api/profile/skills", (c) => c.json({ success: true, skills: SKILLS, costumes: COSTUMES }));
-app.post("/api/login", async (c) => { const body = await c.req.json<{ username?: string; password?: string }>(); const username = body.username?.trim().toLowerCase(); const password = body.password ?? ""; if (!username || !password) return c.json({ success: false, error: "Inserisci username e password" }, 400); if (username === "admin") { if (!c.env.ADMIN_PASSWORD) return c.json({ success: false, error: "ADMIN_PASSWORD non configurata sul backend" }, 500); if (password !== c.env.ADMIN_PASSWORD) return c.json({ success: false, error: "Credenziali non valide" }, 401); const user: SessionUser = { id: "admin", nome: "Admin", cognome: "", username: "admin", role: "admin" }; return c.json({ success: true, token: await createSession(c.env.DB, user), user }); } const row = await c.env.DB.prepare("SELECT id, nome, cognome, username, password_hash, ruolo FROM users WHERE lower(username) = ? LIMIT 1").bind(username).first<{ id: number; nome: string; cognome: string; username: string; password_hash: string; ruolo: "admin" | "user" }>(); if (!row || row.ruolo !== "user" || !(await verifyPassword(password, row.password_hash))) return c.json({ success: false, error: "Credenziali non valide" }, 401); const user: SessionUser = { id: row.id, nome: row.nome, cognome: row.cognome, username: row.username, role: "user" }; return c.json({ success: true, token: await createSession(c.env.DB, user), user }); });
-app.get("/api/me", async (c) => { const token = getBearerToken(c); if (!token) return c.json({ success: false, error: "Autenticazione richiesta" }, 401); const user = await getSessionUser(c.env.DB, token); if (!user) return c.json({ success: false, error: "Sessione non valida o scaduta" }, 401); if (user.role === "user") { const row = await c.env.DB.prepare("SELECT id, nome, cognome, username, email, ruolo, created_at, telefono, bio, competenze_json, competenze_flag_json FROM users WHERE id = ?").bind(user.id).first(); return c.json({ success: true, user: row ? userFromRow(row) : user }); } return c.json({ success: true, user }); });
-app.get("/api/profile", async (c) => { const user = await requireUser(c); if (user instanceof Response) return user; const row = await c.env.DB.prepare("SELECT id, nome, cognome, username, email, ruolo, created_at, telefono, bio, competenze_json, competenze_flag_json FROM users WHERE id = ? AND ruolo = 'user'").bind(user.id).first(); if (!row) return c.json({ success: false, error: "Profilo non trovato" }, 404); return c.json({ success: true, user: userFromRow(row) }); });
-app.patch("/api/profile", async (c) => { const user = await requireUser(c); if (user instanceof Response) return user; const body = await c.req.json<ProfileBody>(); const current = await c.env.DB.prepare("SELECT id, nome, cognome, username, email, ruolo, created_at, telefono, bio, competenze_json, competenze_flag_json FROM users WHERE id = ? AND ruolo = 'user'").bind(user.id).first(); if (!current) return c.json({ success: false, error: "Profilo non trovato" }, 404); const currentProfile = profileFromRow(current); const skills = body.skills === undefined && body.competenze === undefined ? currentProfile.skills : jsonArray(body.skills ?? body.competenze); const costumeFlags = body.costumeFlags === undefined && body.competenzeFlag === undefined ? currentProfile.costumeFlags : jsonArray(body.costumeFlags ?? body.competenzeFlag); const validSkills = skills.filter((s) => SKILLS.includes(s)); const validCostumes = costumeFlags.filter((s) => COSTUMES.includes(s)); await c.env.DB.prepare("UPDATE users SET email = ?, telefono = ?, bio = ?, competenze_json = ?, competenze_flag_json = ? WHERE id = ?").bind(body.email === undefined ? current.email : (body.email?.trim() || null), body.phone === undefined && body.telefono === undefined ? current.telefono : ((body.phone ?? body.telefono ?? "").trim() || null), body.bio === undefined ? current.bio : body.bio.trim(), JSON.stringify(validSkills), JSON.stringify(validCostumes), user.id).run(); const updated = await c.env.DB.prepare("SELECT id, nome, cognome, username, email, ruolo, created_at, telefono, bio, competenze_json, competenze_flag_json FROM users WHERE id = ?").bind(user.id).first(); return c.json({ success: true, user: userFromRow(updated) }); });
-app.post("/api/logout", async (c) => { const token = getBearerToken(c); if (token) await c.env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await hashToken(token)).run(); return c.json({ success: true }); });
-app.post("/api/admin/users", async (c) => { const admin = await requireAdmin(c); if (admin instanceof Response) return admin; const body = await c.req.json<{ nome?: string; cognome?: string; username?: string; email?: string; password?: string } & ProfileBody>(); const nome = body.nome?.trim(); const cognome = body.cognome?.trim(); const password = body.password?.trim() ?? ""; if (!nome || !cognome) return c.json({ success: false, error: "Nome e cognome sono obbligatori" }, 400); if (password.length < 6) return c.json({ success: false, error: "La password è obbligatoria e deve avere almeno 6 caratteri" }, 400); const customUsername = typeof body.username === "string" ? body.username.trim() : ""; if (customUsername && !/^[A-Za-z0-9._-]{3,40}$/.test(customUsername)) return c.json({ success: false, error: "Lo username può contenere solo lettere, numeri, punto, trattino e trattino basso (3-40 caratteri, senza spazi)" }, 400); const username = customUsername || makeUsername(nome, cognome); if (!username || username === ".") return c.json({ success: false, error: "Impossibile generare lo username" }, 400); const existing = await c.env.DB.prepare("SELECT id FROM users WHERE lower(username) = ? LIMIT 1").bind(username.toLowerCase()).first(); if (existing) return c.json({ success: false, error: `Esiste già un collaboratore con username ${username}` }, 409); const skills = jsonArray(body.skills ?? body.competenze).filter((s) => SKILLS.includes(s)); const costumeFlags = jsonArray(body.costumeFlags ?? body.competenzeFlag).filter((s) => COSTUMES.includes(s)); const passwordHash = await hashPassword(password); const result = await c.env.DB.prepare("INSERT INTO users (nome, cognome, username, email, password_hash, ruolo, telefono, bio, competenze_json, competenze_flag_json) VALUES (?, ?, ?, ?, ?, 'user', ?, ?, ?, ?)").bind(nome, cognome, username, body.email?.trim() || null, passwordHash, body.phone?.trim() || body.telefono?.trim() || null, body.bio?.trim() || null, JSON.stringify(skills), JSON.stringify(costumeFlags)).run(); return c.json({ success: true, user: { id: result.meta.last_row_id, nome, cognome, username, email: body.email?.trim() || null, role: "user", ruolo: "user", created_at: new Date().toISOString(), phone: body.phone?.trim() || body.telefono?.trim() || "", telefono: body.phone?.trim() || body.telefono?.trim() || "", bio: body.bio?.trim() || "", skills, competenze: skills, costumeFlags, competenzeFlag: costumeFlags } }, 201); });
-app.get("/api/admin/users", async (c) => { const admin = await requireAdmin(c); if (admin instanceof Response) return admin; const users = await c.env.DB.prepare("SELECT id, nome, cognome, username, email, ruolo, created_at, telefono, bio, competenze_json, competenze_flag_json FROM users WHERE ruolo = 'user' ORDER BY cognome, nome").all(); return c.json({ success: true, users: users.results.map(userFromRow) }); });
-app.get("/api/admin/users/:id", async (c) => { const admin = await requireAdmin(c); if (admin instanceof Response) return admin; const id = Number(c.req.param("id")); if (!Number.isInteger(id)) return c.json({ success: false, error: "ID non valido" }, 400); const user = await c.env.DB.prepare("SELECT id, nome, cognome, username, email, ruolo, created_at, telefono, bio, competenze_json, competenze_flag_json FROM users WHERE id = ?").bind(id).first(); if (!user) return c.json({ success: false, error: "Collaboratore non trovato" }, 404); return c.json({ success: true, user: userFromRow(user) }); });
-app.patch("/api/admin/users/:id", async (c) => { const admin = await requireAdmin(c); if (admin instanceof Response) return admin; const id = Number(c.req.param("id")); if (!Number.isInteger(id)) return c.json({ success: false, error: "ID non valido" }, 400); const body = await c.req.json<ProfileBody & { email?: string }>(); const current = await c.env.DB.prepare("SELECT id, nome, cognome, username, email, ruolo, created_at, telefono, bio, competenze_json, competenze_flag_json FROM users WHERE id = ? AND ruolo = 'user'").bind(id).first(); if (!current) return c.json({ success: false, error: "Collaboratore non trovato" }, 404); const currentProfile = profileFromRow(current); const skills = body.skills === undefined && body.competenze === undefined ? currentProfile.skills : jsonArray(body.skills ?? body.competenze).filter((s) => SKILLS.includes(s)); const costumeFlags = body.costumeFlags === undefined && body.competenzeFlag === undefined ? currentProfile.costumeFlags : jsonArray(body.costumeFlags ?? body.competenzeFlag).filter((s) => COSTUMES.includes(s)); await c.env.DB.prepare("UPDATE users SET email = ?, telefono = ?, bio = ?, competenze_json = ?, competenze_flag_json = ? WHERE id = ?").bind(body.email === undefined ? current.email : (body.email.trim() || null), body.phone === undefined && body.telefono === undefined ? current.telefono : ((body.phone ?? body.telefono ?? "").trim() || null), body.bio === undefined ? current.bio : body.bio.trim(), JSON.stringify(skills), JSON.stringify(costumeFlags), id).run(); const updated = await c.env.DB.prepare("SELECT id, nome, cognome, username, email, ruolo, created_at, telefono, bio, competenze_json, competenze_flag_json FROM users WHERE id = ?").bind(id).first(); return c.json({ success: true, user: userFromRow(updated) }); });
-app.patch("/api/admin/users/:id/password", async (c) => { const admin = await requireAdmin(c); if (admin instanceof Response) return admin; const id = Number(c.req.param("id")); const body = await c.req.json<{ password?: string }>(); const password = body.password?.trim() ?? ""; if (!Number.isInteger(id)) return c.json({ success: false, error: "ID non valido" }, 400); if (password.length < 6) return c.json({ success: false, error: "La password deve avere almeno 6 caratteri" }, 400); const result = await c.env.DB.prepare("UPDATE users SET password_hash = ? WHERE id = ? AND ruolo = 'user'").bind(await hashPassword(password), id).run(); if (!result.meta.changes) return c.json({ success: false, error: "Collaboratore non trovato" }, 404); return c.json({ success: true }); });
+
+// ---------------------------------------------------------------------------
+// Accesso
+// ---------------------------------------------------------------------------
+
+app.post("/api/login", async (c) => {
+  const b = await body<{ username?: string; password?: string }>(c);
+  const username = b.username?.trim().toLowerCase() ?? "";
+  const password = b.password ?? "";
+  if (!username || !password) return fail(c, 400, "Inserisci username e password");
+
+  if (username === "admin") {
+    if (!c.env.ADMIN_PASSWORD) return fail(c, 500, "ADMIN_PASSWORD non configurata sul backend");
+    if (password !== c.env.ADMIN_PASSWORD) return fail(c, 401, "Credenziali non valide");
+    const user: SessionUser = { id: "admin", nome: "Admin", cognome: "", username: "admin", role: "admin" };
+    return c.json({ success: true, token: await createSession(c.env.DB, user), user });
+  }
+
+  const row = await c.env.DB
+    .prepare("SELECT id, nome, cognome, username, password_hash, ruolo, attivo FROM users WHERE lower(username) = ? LIMIT 1")
+    .bind(username)
+    .first<{ id: number; nome: string; cognome: string; username: string; password_hash: string; ruolo: string; attivo: number }>();
+  if (!row || row.ruolo !== "user" || !(await verifyPassword(password, row.password_hash))) return fail(c, 401, "Credenziali non valide");
+  if (row.attivo === 0) return fail(c, 403, "Account disattivato: contatta l'admin");
+  const user: SessionUser = { id: row.id, nome: row.nome, cognome: row.cognome, username: row.username, role: "user" };
+  return c.json({ success: true, token: await createSession(c.env.DB, user), user });
+});
+
+app.get("/api/me", async (c) => {
+  const me = await sessionFromRequest(c);
+  if (!me) return fail(c, 401, "Sessione non valida o scaduta");
+  if (me.role === "admin") return c.json({ success: true, user: me });
+  const row = await c.env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).bind(me.id).first();
+  return c.json({ success: true, user: row ? userFromRow(row) : me });
+});
+
+app.post("/api/logout", async (c) => {
+  const header = c.req.header("Authorization");
+  if (header?.startsWith("Bearer ")) {
+    await c.env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await hashToken(header.slice(7).trim())).run();
+  }
+  return c.json({ success: true });
+});
+
+// ---------------------------------------------------------------------------
+// Profilo dello user (solo i propri dati)
+// ---------------------------------------------------------------------------
+
+app.get("/api/profile", async (c) => {
+  const me = c.get("me");
+  const row = await c.env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).bind(me.id).first();
+  if (!row) return fail(c, 404, "Profilo non trovato");
+  return c.json({ success: true, user: userFromRow(row) });
+});
+
+// Lo user può modificare: telefono, email, presentazione, competenze.
+app.patch("/api/profile", async (c) => {
+  const me = c.get("me");
+  const b = await body<Record<string, unknown>>(c);
+  const current = await c.env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).bind(me.id).first();
+  if (!current) return fail(c, 404, "Profilo non trovato");
+  const u = userFromRow(current);
+  const competenze = b.competenze !== undefined ? tagList(b.competenze) : u.competenze;
+  const flag = b.competenzeFlag !== undefined ? tagList(b.competenzeFlag).filter((t) => competenze.includes(t)) : u.competenzeFlag;
+  await c.env.DB
+    .prepare("UPDATE users SET email = ?, telefono = ?, bio = ?, competenze_json = ?, competenze_flag_json = ? WHERE id = ?")
+    .bind(
+      b.email !== undefined ? str(b.email, 200) : u.email || null,
+      b.telefono !== undefined ? str(b.telefono, 50) : u.telefono || null,
+      b.bio !== undefined ? str(b.bio) : u.bio || null,
+      JSON.stringify(competenze),
+      JSON.stringify(flag),
+      me.id,
+    )
+    .run();
+  const row = await c.env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).bind(me.id).first();
+  return c.json({ success: true, user: userFromRow(row!) });
+});
+
+app.post("/api/profile/password", async (c) => {
+  const me = c.get("me");
+  const b = await body<{ attuale?: string; nuova?: string }>(c);
+  const nuova = b.nuova?.trim() ?? "";
+  if (nuova.length < 6) return fail(c, 400, "La nuova password deve avere almeno 6 caratteri");
+  const row = await c.env.DB.prepare("SELECT password_hash FROM users WHERE id = ?").bind(me.id).first<{ password_hash: string }>();
+  if (!row || !(await verifyPassword(b.attuale ?? "", row.password_hash))) return fail(c, 400, "La password attuale non è corretta");
+  await c.env.DB.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(await hashPassword(nuova), me.id).run();
+  return c.json({ success: true });
+});
+
+// Costumi personali dello user
+app.get("/api/profile/costumes", async (c) => {
+  const me = c.get("me");
+  const rows = await c.env.DB.prepare("SELECT id, nome, categoria, note, created_at FROM user_costumes WHERE user_id = ? ORDER BY nome").bind(me.id).all();
+  return c.json({ success: true, costumes: rows.results });
+});
+app.post("/api/profile/costumes", async (c) => {
+  const me = c.get("me");
+  const b = await body(c);
+  const nome = str(b.nome, 120);
+  if (!nome) return fail(c, 400, "Il nome del costume è obbligatorio");
+  const r = await c.env.DB.prepare("INSERT INTO user_costumes (user_id, nome, categoria, note) VALUES (?, ?, ?, ?)").bind(me.id, nome, str(b.categoria, 80), str(b.note, 500)).run();
+  return c.json({ success: true, id: r.meta.last_row_id }, 201);
+});
+app.patch("/api/profile/costumes/:cid", async (c) => {
+  const me = c.get("me");
+  const cid = intParam(c, "cid");
+  const b = await body(c);
+  const nome = str(b.nome, 120);
+  if (!cid || !nome) return fail(c, 400, "Dati non validi");
+  const r = await c.env.DB.prepare("UPDATE user_costumes SET nome = ?, categoria = ?, note = ? WHERE id = ? AND user_id = ?").bind(nome, str(b.categoria, 80), str(b.note, 500), cid, me.id).run();
+  if (!r.meta.changes) return fail(c, 404, "Costume non trovato");
+  return c.json({ success: true });
+});
+app.delete("/api/profile/costumes/:cid", async (c) => {
+  const me = c.get("me");
+  const cid = intParam(c, "cid");
+  if (!cid) return fail(c, 400, "ID non valido");
+  const r = await c.env.DB.prepare("DELETE FROM user_costumes WHERE id = ? AND user_id = ?").bind(cid, me.id).run();
+  if (!r.meta.changes) return fail(c, 404, "Costume non trovato");
+  return c.json({ success: true });
+});
+
+// ---------------------------------------------------------------------------
+// Admin: user
+// ---------------------------------------------------------------------------
+
+app.get("/api/admin/users", async (c) => {
+  const rows = await c.env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE ruolo = 'user' ORDER BY cognome, nome`).all();
+  const costumes = await c.env.DB.prepare("SELECT user_id, nome FROM user_costumes").all<{ user_id: number; nome: string }>();
+  const byUser = new Map<number, string[]>();
+  for (const cst of costumes.results) byUser.set(cst.user_id, [...(byUser.get(cst.user_id) ?? []), cst.nome]);
+  return c.json({ success: true, users: rows.results.map((r) => ({ ...userFromRow(r), costumi: byUser.get(r.id as number) ?? [] })) });
+});
+
+app.post("/api/admin/users", async (c) => {
+  const b = await body(c);
+  const nome = str(b.nome, 80);
+  const cognome = str(b.cognome, 80);
+  const password = typeof b.password === "string" ? b.password.trim() : "";
+  if (!nome || !cognome) return fail(c, 400, "Nome e cognome sono obbligatori");
+  if (password.length < 6) return fail(c, 400, "La password è obbligatoria e deve avere almeno 6 caratteri");
+  const custom = typeof b.username === "string" ? b.username.trim() : "";
+  if (custom && !/^[A-Za-z0-9._-]{3,40}$/.test(custom)) return fail(c, 400, "Lo username può contenere solo lettere, numeri, punto, trattino e trattino basso (3-40 caratteri, senza spazi)");
+  const username = custom || `${normalizePart(nome)}.${normalizePart(cognome)}`;
+  if (username.toLowerCase() === "admin") return fail(c, 400, "Lo username 'admin' è riservato");
+  const exists = await c.env.DB.prepare("SELECT id FROM users WHERE lower(username) = ?").bind(username.toLowerCase()).first();
+  if (exists) return fail(c, 409, `Esiste già uno user con username ${username}`);
+  const competenze = tagList(b.competenze);
+  const flag = tagList(b.competenzeFlag).filter((t) => competenze.includes(t));
+  const r = await c.env.DB
+    .prepare(
+      `INSERT INTO users (nome, cognome, username, email, password_hash, ruolo, telefono, bio, note, qualifica, competenze_json, competenze_flag_json)
+       VALUES (?, ?, ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(nome, cognome, username, str(b.email, 200), await hashPassword(password), str(b.telefono, 50), str(b.bio), str(b.note), str(b.qualifica, 120), JSON.stringify(competenze), JSON.stringify(flag))
+    .run();
+  const row = await c.env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).bind(r.meta.last_row_id).first();
+  return c.json({ success: true, user: userFromRow(row!) }, 201);
+});
+
+app.get("/api/admin/users/:id", async (c) => {
+  const id = intParam(c, "id");
+  if (!id) return fail(c, 400, "ID non valido");
+  const row = await c.env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ? AND ruolo = 'user'`).bind(id).first();
+  if (!row) return fail(c, 404, "User non trovato");
+  const costumes = await c.env.DB.prepare("SELECT id, nome, categoria, note FROM user_costumes WHERE user_id = ? ORDER BY nome").bind(id).all();
+  const events = await c.env.DB
+    .prepare(
+      `SELECT e.code, e.nome, e.data, e.stato AS stato_evento, p.stato FROM event_participants p
+       JOIN events e ON e.id = p.event_id WHERE p.user_id = ? ORDER BY e.data DESC`,
+    )
+    .bind(id)
+    .all();
+  return c.json({ success: true, user: userFromRow(row), costumes: costumes.results, events: events.results });
+});
+
+app.patch("/api/admin/users/:id", async (c) => {
+  const id = intParam(c, "id");
+  if (!id) return fail(c, 400, "ID non valido");
+  const current = await c.env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ? AND ruolo = 'user'`).bind(id).first();
+  if (!current) return fail(c, 404, "User non trovato");
+  const u = userFromRow(current);
+  const b = await body(c);
+  const competenze = b.competenze !== undefined ? tagList(b.competenze) : u.competenze;
+  const flag = b.competenzeFlag !== undefined ? tagList(b.competenzeFlag).filter((t) => competenze.includes(t)) : u.competenzeFlag;
+  await c.env.DB
+    .prepare(
+      `UPDATE users SET nome = ?, cognome = ?, email = ?, telefono = ?, bio = ?, note = ?, qualifica = ?, attivo = ?,
+       competenze_json = ?, competenze_flag_json = ? WHERE id = ?`,
+    )
+    .bind(
+      b.nome !== undefined ? str(b.nome, 80) ?? u.nome : u.nome,
+      b.cognome !== undefined ? str(b.cognome, 80) ?? u.cognome : u.cognome,
+      b.email !== undefined ? str(b.email, 200) : u.email || null,
+      b.telefono !== undefined ? str(b.telefono, 50) : u.telefono || null,
+      b.bio !== undefined ? str(b.bio) : u.bio || null,
+      b.note !== undefined ? str(b.note) : u.note || null,
+      b.qualifica !== undefined ? str(b.qualifica, 120) : u.qualifica || null,
+      b.attivo !== undefined ? bool(b.attivo) : u.attivo ? 1 : 0,
+      JSON.stringify(competenze),
+      JSON.stringify(flag),
+      id,
+    )
+    .run();
+  if (b.attivo !== undefined && !bool(b.attivo)) await c.env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+  const row = await c.env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).bind(id).first();
+  return c.json({ success: true, user: userFromRow(row!) });
+});
+
+app.patch("/api/admin/users/:id/password", async (c) => {
+  const id = intParam(c, "id");
+  const b = await body(c);
+  const password = typeof b.password === "string" ? b.password.trim() : "";
+  if (!id) return fail(c, 400, "ID non valido");
+  if (password.length < 6) return fail(c, 400, "La password deve avere almeno 6 caratteri");
+  const r = await c.env.DB.prepare("UPDATE users SET password_hash = ? WHERE id = ? AND ruolo = 'user'").bind(await hashPassword(password), id).run();
+  if (!r.meta.changes) return fail(c, 404, "User non trovato");
+  await c.env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+  return c.json({ success: true });
+});
+
+app.delete("/api/admin/users/:id", async (c) => {
+  const id = intParam(c, "id");
+  if (!id) return fail(c, 400, "ID non valido");
+  await c.env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
+  await c.env.DB.prepare("UPDATE load_rows SET assigned_user_id = NULL WHERE assigned_user_id = ?").bind(id).run();
+  await c.env.DB.prepare("DELETE FROM notifications WHERE user_id = ?").bind(id).run();
+  await c.env.DB.prepare("DELETE FROM event_participants WHERE user_id = ?").bind(id).run();
+  await c.env.DB.prepare("DELETE FROM user_costumes WHERE user_id = ?").bind(id).run();
+  const r = await c.env.DB.prepare("DELETE FROM users WHERE id = ? AND ruolo = 'user'").bind(id).run();
+  if (!r.meta.changes) return fail(c, 404, "User non trovato");
+  return c.json({ success: true });
+});
+
+// Costumi di uno user, gestiti dall'admin
+app.post("/api/admin/users/:id/costumes", async (c) => {
+  const id = intParam(c, "id");
+  const b = await body(c);
+  const nome = str(b.nome, 120);
+  if (!id || !nome) return fail(c, 400, "Il nome del costume è obbligatorio");
+  const exists = await c.env.DB.prepare("SELECT id FROM users WHERE id = ? AND ruolo = 'user'").bind(id).first();
+  if (!exists) return fail(c, 404, "User non trovato");
+  const r = await c.env.DB.prepare("INSERT INTO user_costumes (user_id, nome, categoria, note) VALUES (?, ?, ?, ?)").bind(id, nome, str(b.categoria, 80), str(b.note, 500)).run();
+  return c.json({ success: true, id: r.meta.last_row_id }, 201);
+});
+app.delete("/api/admin/users/:id/costumes/:cid", async (c) => {
+  const id = intParam(c, "id");
+  const cid = intParam(c, "cid");
+  if (!id || !cid) return fail(c, 400, "ID non valido");
+  const r = await c.env.DB.prepare("DELETE FROM user_costumes WHERE id = ? AND user_id = ?").bind(cid, id).run();
+  if (!r.meta.changes) return fail(c, 404, "Costume non trovato");
+  return c.json({ success: true });
+});
+
+// ---------------------------------------------------------------------------
+// Admin: eventi
+// ---------------------------------------------------------------------------
+
+const EVENT_FIELDS = [
+  "nome", "data", "ora_ritrovo", "ora_inizio", "ora_fine", "luogo", "tipo", "descrizione", "info_operative",
+  "referente_nome", "referente_telefono", "compenso", "note_admin", "motivo_annullamento",
+] as const;
+
+async function eventByCode(db: D1Database, code: string) {
+  return db.prepare("SELECT * FROM events WHERE code = ?").bind(code).first();
+}
+
+async function newEventCode(db: D1Database, date: string): Promise<string> {
+  const base = `MAL-${date.replace(/-/g, "").slice(2, 8)}`;
+  const rows = await db.prepare("SELECT code FROM events WHERE code LIKE ?").bind(`${base}-%`).all<{ code: string }>();
+  let n = rows.results.length + 1;
+  const used = new Set(rows.results.map((r) => r.code));
+  while (used.has(`${base}-${String(n).padStart(2, "0")}`)) n += 1;
+  return `${base}-${String(n).padStart(2, "0")}`;
+}
+
+app.get("/api/admin/events", async (c) => {
+  const rows = await c.env.DB
+    .prepare(
+      `SELECT e.*,
+        (SELECT COUNT(*) FROM event_participants p WHERE p.event_id = e.id) AS invitati,
+        (SELECT COUNT(*) FROM event_participants p WHERE p.event_id = e.id AND p.stato = 'pending') AS in_attesa,
+        (SELECT COUNT(*) FROM event_participants p WHERE p.event_id = e.id AND p.stato = 'available') AS disponibili,
+        (SELECT COUNT(*) FROM event_participants p WHERE p.event_id = e.id AND p.stato = 'confirmed') AS confermati,
+        (SELECT COUNT(*) FROM load_rows l WHERE l.event_id = e.id) AS righe_bolla,
+        (SELECT COUNT(*) FROM load_rows l WHERE l.event_id = e.id AND l.damaged = 1) AS danni
+       FROM events e ORDER BY e.data, e.ora_inizio`,
+    )
+    .all();
+  return c.json({
+    success: true,
+    events: rows.results.map((r) => ({
+      ...eventFromRow(r),
+      conteggi: { invitati: r.invitati, in_attesa: r.in_attesa, disponibili: r.disponibili, confermati: r.confermati, righe_bolla: r.righe_bolla, danni: r.danni },
+    })),
+  });
+});
+
+app.post("/api/admin/events", async (c) => {
+  const b = await body(c);
+  const nome = str(b.nome, 160);
+  const data = str(b.data, 10);
+  if (!nome) return fail(c, 400, "Il nome dell'evento è obbligatorio");
+  if (!data || !/^\d{4}-\d{2}-\d{2}$/.test(data)) return fail(c, 400, "La data dell'evento è obbligatoria (formato AAAA-MM-GG)");
+  const stato = typeof b.stato === "string" && EVENT_STATES.includes(b.stato) ? b.stato : "richiesta";
+  const code = await newEventCode(c.env.DB, data);
+  const values = EVENT_FIELDS.map((f) => (f === "nome" ? nome : f === "data" ? data : str(b[f])));
+  await c.env.DB
+    .prepare(`INSERT INTO events (code, ${EVENT_FIELDS.join(", ")}, compenso_visibile, stato) VALUES (?, ${EVENT_FIELDS.map(() => "?").join(", ")}, ?, ?)`)
+    .bind(code, ...values, bool(b.compenso_visibile), stato)
+    .run();
+  const ev = await eventByCode(c.env.DB, code);
+  const event = eventFromRow(ev!);
+  // inviti immediati
+  const ids = Array.isArray(b.user_ids) ? b.user_ids.filter((x): x is number => Number.isInteger(x)) : [];
+  for (const uid of ids) await inviteUser(c.env.DB, event.id, event.nome, uid);
+  return c.json({ success: true, event }, 201);
+});
+
+app.get("/api/admin/events/:code", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  if (!ev) return fail(c, 404, "Evento non trovato");
+  const event = eventFromRow(ev);
+  const participants = await c.env.DB
+    .prepare(
+      `SELECT p.*, u.nome, u.cognome, u.username, u.qualifica FROM event_participants p
+       JOIN users u ON u.id = p.user_id WHERE p.event_id = ? ORDER BY u.cognome, u.nome`,
+    )
+    .bind(event.id)
+    .all();
+  const rows = await c.env.DB
+    .prepare(
+      `SELECT l.*, u.nome AS assigned_nome, u.cognome AS assigned_cognome FROM load_rows l
+       LEFT JOIN users u ON u.id = l.assigned_user_id WHERE l.event_id = ? ORDER BY l.id`,
+    )
+    .bind(event.id)
+    .all();
+  return c.json({ success: true, event, participants: participants.results, load_rows: rows.results.map(loadRowFromRow) });
+});
+
+app.patch("/api/admin/events/:code", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  if (!ev) return fail(c, 404, "Evento non trovato");
+  const event = eventFromRow(ev);
+  const b = await body(c);
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const f of EVENT_FIELDS) {
+    if (b[f] === undefined) continue;
+    const v = str(b[f]);
+    if ((f === "nome" || f === "data") && !v) return fail(c, 400, `Il campo ${f} non può essere vuoto`);
+    if (f === "data" && v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) return fail(c, 400, "Data non valida (formato AAAA-MM-GG)");
+    sets.push(`${f} = ?`);
+    vals.push(v);
+  }
+  if (b.compenso_visibile !== undefined) {
+    sets.push("compenso_visibile = ?");
+    vals.push(bool(b.compenso_visibile));
+  }
+  if (b.stato !== undefined) {
+    if (typeof b.stato !== "string" || !EVENT_STATES.includes(b.stato)) return fail(c, 400, "Stato evento non valido");
+    sets.push("stato = ?");
+    vals.push(b.stato);
+  }
+  if (!sets.length) return c.json({ success: true, event });
+  sets.push("updated_at = datetime('now')");
+  await c.env.DB.prepare(`UPDATE events SET ${sets.join(", ")} WHERE id = ?`).bind(...vals, event.id).run();
+  const updated = eventFromRow((await c.env.DB.prepare("SELECT * FROM events WHERE id = ?").bind(event.id).first())!);
+  // avvisa gli user coinvolti (non quelli che hanno rifiutato o sono stati esclusi)
+  const message =
+    b.stato === "annullato" && event.stato !== "annullato"
+      ? `L'evento ${updated.nome} del ${updated.data} è stato annullato`
+      : `L'evento ${updated.nome} è stato aggiornato`;
+  const people = await c.env.DB
+    .prepare("SELECT user_id FROM event_participants WHERE event_id = ? AND stato IN ('pending', 'available', 'confirmed')")
+    .bind(event.id)
+    .all<{ user_id: number }>();
+  if (b.notify !== false) for (const p of people.results) await notifyUser(c.env.DB, p.user_id, "evento_modificato", message, event.id);
+  return c.json({ success: true, event: updated });
+});
+
+app.delete("/api/admin/events/:code", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  if (!ev) return fail(c, 404, "Evento non trovato");
+  const id = ev.id as number;
+  await c.env.DB.prepare("DELETE FROM notifications WHERE event_id = ?").bind(id).run();
+  await c.env.DB.prepare("DELETE FROM load_rows WHERE event_id = ?").bind(id).run();
+  await c.env.DB.prepare("DELETE FROM event_participants WHERE event_id = ?").bind(id).run();
+  await c.env.DB.prepare("DELETE FROM events WHERE id = ?").bind(id).run();
+  return c.json({ success: true });
+});
+
+async function inviteUser(db: D1Database, eventId: number, eventName: string, userId: number, ruolo?: string | null): Promise<boolean> {
+  const u = await db.prepare("SELECT id FROM users WHERE id = ? AND ruolo = 'user'").bind(userId).first();
+  if (!u) return false;
+  const r = await db
+    .prepare("INSERT INTO event_participants (event_id, user_id, stato, ruolo_evento) VALUES (?, ?, 'pending', ?) ON CONFLICT(event_id, user_id) DO NOTHING")
+    .bind(eventId, userId, ruolo ?? null)
+    .run();
+  if (r.meta.changes) await notifyUser(db, userId, "richiesta", `Nuova richiesta di disponibilità per ${eventName}`, eventId);
+  return true;
+}
+
+app.post("/api/admin/events/:code/participants", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  if (!ev) return fail(c, 404, "Evento non trovato");
+  const b = await body(c);
+  const ids = Array.isArray(b.user_ids) ? b.user_ids.filter((x): x is number => Number.isInteger(x)) : [];
+  if (!ids.length) return fail(c, 400, "Seleziona almeno uno user");
+  for (const uid of ids) await inviteUser(c.env.DB, ev.id as number, ev.nome as string, uid, str(b.ruolo_evento, 120));
+  return c.json({ success: true });
+});
+
+app.patch("/api/admin/events/:code/participants/:userId", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  const userId = intParam(c, "userId");
+  if (!ev || !userId) return fail(c, 404, "Evento o user non trovato");
+  const current = await c.env.DB.prepare("SELECT * FROM event_participants WHERE event_id = ? AND user_id = ?").bind(ev.id, userId).first<{ stato: string }>();
+  if (!current) return fail(c, 404, "Questo user non è coinvolto nell'evento");
+  const b = await body(c);
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  if (b.stato !== undefined) {
+    if (typeof b.stato !== "string" || !PARTICIPANT_STATES.includes(b.stato)) return fail(c, 400, "Stato non valido");
+    sets.push("stato = ?", "decided_at = datetime('now')");
+    vals.push(b.stato);
+  }
+  if (b.ruolo_evento !== undefined) {
+    sets.push("ruolo_evento = ?");
+    vals.push(str(b.ruolo_evento, 120));
+  }
+  if (b.nota_admin !== undefined) {
+    sets.push("nota_admin = ?");
+    vals.push(str(b.nota_admin, 1000));
+  }
+  if (!sets.length) return c.json({ success: true });
+  await c.env.DB.prepare(`UPDATE event_participants SET ${sets.join(", ")} WHERE event_id = ? AND user_id = ?`).bind(...vals, ev.id, userId).run();
+  if (b.stato === "confirmed" && current.stato !== "confirmed") await notifyUser(c.env.DB, userId, "confermato", `Sei stato confermato per ${ev.nome as string}`, ev.id as number);
+  if (b.stato === "rejected" && current.stato !== "rejected") await notifyUser(c.env.DB, userId, "non_confermato", `Non sei stato selezionato per ${ev.nome as string}`, ev.id as number);
+  return c.json({ success: true });
+});
+
+app.delete("/api/admin/events/:code/participants/:userId", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  const userId = intParam(c, "userId");
+  if (!ev || !userId) return fail(c, 404, "Evento o user non trovato");
+  await c.env.DB.prepare("DELETE FROM event_participants WHERE event_id = ? AND user_id = ?").bind(ev.id, userId).run();
+  await c.env.DB.prepare("UPDATE load_rows SET assigned_user_id = NULL WHERE event_id = ? AND assigned_user_id = ?").bind(ev.id, userId).run();
+  return c.json({ success: true });
+});
+
+// Bolla di carico (admin)
+function loadRowValues(b: Record<string, unknown>) {
+  const qty = Number(b.quantita);
+  return {
+    item: str(b.item, 160),
+    categoria: str(b.categoria, 60),
+    codice: str(b.codice, 60),
+    taglia: str(b.taglia, 30),
+    quantita: Number.isInteger(qty) && qty > 0 ? qty : 1,
+    assigned: Number.isInteger(b.assigned_user_id) ? (b.assigned_user_id as number) : null,
+  };
+}
+
+app.post("/api/admin/events/:code/load-rows", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  if (!ev) return fail(c, 404, "Evento non trovato");
+  const b = await body(c);
+  const list = Array.isArray(b.rows) ? (b.rows as Record<string, unknown>[]) : [b];
+  const notified = new Set<number>();
+  let added = 0;
+  for (const raw of list.slice(0, 500)) {
+    const v = loadRowValues(raw);
+    if (!v.item) continue;
+    await c.env.DB
+      .prepare("INSERT INTO load_rows (event_id, item, categoria, codice, taglia, quantita, assigned_user_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .bind(ev.id, v.item, v.categoria, v.codice, v.taglia, v.quantita, v.assigned)
+      .run();
+    added += 1;
+    if (v.assigned && !notified.has(v.assigned)) {
+      notified.add(v.assigned);
+      await notifyUser(c.env.DB, v.assigned, "bolla", `Bolla di carico aggiornata per ${ev.nome as string}`, ev.id as number);
+    }
+  }
+  if (!added) return fail(c, 400, "Nessuna riga valida: serve almeno il nome dell'oggetto");
+  return c.json({ success: true, added }, 201);
+});
+
+app.patch("/api/admin/load-rows/:rid", async (c) => {
+  const rid = intParam(c, "rid");
+  if (!rid) return fail(c, 400, "ID non valido");
+  const row = await c.env.DB.prepare("SELECT l.*, e.nome AS event_nome FROM load_rows l JOIN events e ON e.id = l.event_id WHERE l.id = ?").bind(rid).first();
+  if (!row) return fail(c, 404, "Riga non trovata");
+  const b = await body(c);
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const f of ["item", "categoria", "codice", "taglia", "comment"] as const) {
+    if (b[f] === undefined) continue;
+    const v = str(b[f], f === "comment" ? 1000 : 160);
+    if (f === "item" && !v) return fail(c, 400, "Il nome dell'oggetto non può essere vuoto");
+    sets.push(`${f} = ?`);
+    vals.push(v);
+  }
+  if (b.quantita !== undefined) {
+    const q = Number(b.quantita);
+    sets.push("quantita = ?");
+    vals.push(Number.isInteger(q) && q > 0 ? q : 1);
+  }
+  for (const f of ["present", "returned", "damaged"] as const) {
+    if (b[f] === undefined) continue;
+    sets.push(`${f} = ?`);
+    vals.push(bool(b[f]));
+  }
+  let newAssignee: number | null = null;
+  if (b.assigned_user_id !== undefined) {
+    newAssignee = Number.isInteger(b.assigned_user_id) ? (b.assigned_user_id as number) : null;
+    sets.push("assigned_user_id = ?");
+    vals.push(newAssignee);
+  }
+  if (!sets.length) return c.json({ success: true });
+  sets.push("updated_by = 'admin'", "updated_at = datetime('now')");
+  await c.env.DB.prepare(`UPDATE load_rows SET ${sets.join(", ")} WHERE id = ?`).bind(...vals, rid).run();
+  if (newAssignee && newAssignee !== row.assigned_user_id) await notifyUser(c.env.DB, newAssignee, "bolla", `Bolla di carico aggiornata per ${row.event_nome as string}`, row.event_id as number);
+  return c.json({ success: true });
+});
+
+app.delete("/api/admin/load-rows/:rid", async (c) => {
+  const rid = intParam(c, "rid");
+  if (!rid) return fail(c, 400, "ID non valido");
+  await c.env.DB.prepare("DELETE FROM load_rows WHERE id = ?").bind(rid).run();
+  return c.json({ success: true });
+});
+
+// Report: note per evento
+app.get("/api/admin/report", async (c) => {
+  const code = c.req.query("event");
+  const onlyIssues = c.req.query("solo_problemi") === "1";
+  const where: string[] = [];
+  const vals: unknown[] = [];
+  if (code) {
+    where.push("e.code = ?");
+    vals.push(code);
+  }
+  if (onlyIssues) where.push("(l.damaged = 1 OR (l.comment IS NOT NULL AND l.comment != '') OR (l.present = 1 AND l.returned = 0))");
+  const rows = await c.env.DB
+    .prepare(
+      `SELECT l.*, e.code AS event_code, e.nome AS event_nome, e.data AS event_data, u.nome AS assigned_nome, u.cognome AS assigned_cognome
+       FROM load_rows l JOIN events e ON e.id = l.event_id LEFT JOIN users u ON u.id = l.assigned_user_id
+       ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY e.data DESC, l.id`,
+    )
+    .bind(...vals)
+    .all();
+  return c.json({
+    success: true,
+    rows: rows.results.map((r) => ({ ...loadRowFromRow(r), event_code: r.event_code, event_nome: r.event_nome, event_data: r.event_data })),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// User: i miei eventi
+// ---------------------------------------------------------------------------
+
+function eventForUser(row: Record<string, unknown>, myStato: string) {
+  const e = eventFromRow(row);
+  const showFee = e.compenso_visibile && myStato === "confirmed";
+  return {
+    id: e.id, code: e.code, nome: e.nome, data: e.data, ora_ritrovo: e.ora_ritrovo, ora_inizio: e.ora_inizio, ora_fine: e.ora_fine,
+    luogo: e.luogo, tipo: e.tipo, descrizione: e.descrizione, stato: e.stato, motivo_annullamento: e.motivo_annullamento,
+    // informazioni operative e referente solo a chi è confermato
+    info_operative: myStato === "confirmed" ? e.info_operative : "",
+    referente_nome: myStato === "confirmed" ? e.referente_nome : "",
+    referente_telefono: myStato === "confirmed" ? e.referente_telefono : "",
+    compenso: showFee ? e.compenso : "",
+  };
+}
+
+app.get("/api/my/events", async (c) => {
+  const me = c.get("me");
+  const rows = await c.env.DB
+    .prepare(
+      `SELECT e.*, p.stato AS mio_stato, p.ruolo_evento,
+        (SELECT COUNT(*) FROM load_rows l WHERE l.event_id = e.id AND l.assigned_user_id = ?) AS mie_righe
+       FROM event_participants p JOIN events e ON e.id = p.event_id WHERE p.user_id = ? ORDER BY e.data, e.ora_inizio`,
+    )
+    .bind(me.id, me.id)
+    .all();
+  return c.json({
+    success: true,
+    events: rows.results.map((r) => ({ ...eventForUser(r, r.mio_stato as string), mio_stato: r.mio_stato, ruolo_evento: r.ruolo_evento ?? "", mie_righe_bolla: r.mie_righe })),
+  });
+});
+
+async function myParticipation(c: C, code: string) {
+  const me = c.get("me");
+  return c.env.DB
+    .prepare(
+      `SELECT e.*, p.stato AS mio_stato, p.ruolo_evento, p.nota_user, p.nota_admin FROM events e
+       JOIN event_participants p ON p.event_id = e.id WHERE e.code = ? AND p.user_id = ?`,
+    )
+    .bind(code, me.id)
+    .first();
+}
+
+app.get("/api/my/events/:code", async (c) => {
+  const me = c.get("me");
+  const row = await myParticipation(c, c.req.param("code"));
+  if (!row) return fail(c, 404, "Evento non trovato o non sei coinvolto");
+  const stato = row.mio_stato as string;
+  const team =
+    stato === "confirmed"
+      ? (
+          await c.env.DB
+            .prepare("SELECT u.nome, u.cognome, p.ruolo_evento FROM event_participants p JOIN users u ON u.id = p.user_id WHERE p.event_id = ? AND p.stato = 'confirmed' ORDER BY u.cognome")
+            .bind(row.id)
+            .all()
+        ).results
+      : [];
+  const rows = await c.env.DB
+    .prepare("SELECT * FROM load_rows WHERE event_id = ? AND assigned_user_id = ? ORDER BY id")
+    .bind(row.id, me.id)
+    .all();
+  return c.json({
+    success: true,
+    event: eventForUser(row, stato),
+    partecipazione: { stato, ruolo_evento: row.ruolo_evento ?? "", nota_user: row.nota_user ?? "", nota_admin: row.nota_admin ?? "" },
+    team,
+    load_rows: rows.results.map(loadRowFromRow),
+  });
+});
+
+app.post("/api/my/events/:code/availability", async (c) => {
+  const me = c.get("me");
+  const row = await myParticipation(c, c.req.param("code"));
+  if (!row) return fail(c, 404, "Evento non trovato o non sei coinvolto");
+  const b = await body(c);
+  const stato = b.stato;
+  if (stato !== "available" && stato !== "unavailable") return fail(c, 400, "Risposta non valida");
+  if (row.mio_stato === "confirmed" || row.mio_stato === "rejected") return fail(c, 409, "L'admin ha già deciso: per cambiare contatta l'ufficio");
+  if (row.stato === "annullato" || row.stato === "chiuso") return fail(c, 409, "L'evento non accetta più risposte");
+  await c.env.DB
+    .prepare("UPDATE event_participants SET stato = ?, nota_user = ?, responded_at = datetime('now') WHERE event_id = ? AND user_id = ?")
+    .bind(stato, str(b.nota, 1000), row.id, me.id)
+    .run();
+  const who = `${me.nome} ${me.cognome}`.trim();
+  await notifyAdmin(
+    c.env.DB,
+    "risposta",
+    stato === "available" ? `${who} ha dato disponibilità per ${row.nome as string}` : `${who} non è disponibile per ${row.nome as string}`,
+    row.id as number,
+  );
+  return c.json({ success: true });
+});
+
+app.patch("/api/my/load-rows/:rid", async (c) => {
+  const me = c.get("me");
+  const rid = intParam(c, "rid");
+  if (!rid) return fail(c, 400, "ID non valido");
+  const row = await c.env.DB
+    .prepare(
+      `SELECT l.*, e.nome AS event_nome, e.stato AS event_stato, p.stato AS mio_stato FROM load_rows l
+       JOIN events e ON e.id = l.event_id
+       LEFT JOIN event_participants p ON p.event_id = l.event_id AND p.user_id = ?
+       WHERE l.id = ?`,
+    )
+    .bind(me.id, rid)
+    .first();
+  if (!row || row.assigned_user_id !== me.id) return fail(c, 403, "Questa riga della bolla non è assegnata a te");
+  if (row.mio_stato !== "confirmed") return fail(c, 403, "Puoi compilare la bolla solo dopo la conferma per l'evento");
+  const b = await body(c);
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const f of ["present", "returned", "damaged"] as const) {
+    if (b[f] === undefined) continue;
+    sets.push(`${f} = ?`);
+    vals.push(bool(b[f]));
+  }
+  if (b.comment !== undefined) {
+    sets.push("comment = ?");
+    vals.push(str(b.comment, 1000));
+  }
+  if (!sets.length) return c.json({ success: true });
+  sets.push("updated_by = ?", "updated_at = datetime('now')");
+  vals.push(`${me.nome} ${me.cognome}`.trim());
+  await c.env.DB.prepare(`UPDATE load_rows SET ${sets.join(", ")} WHERE id = ?`).bind(...vals, rid).run();
+  if (b.damaged !== undefined && bool(b.damaged) && row.damaged !== 1) {
+    await notifyAdmin(c.env.DB, "danno", `${me.nome} ${me.cognome} ha segnalato un danno: ${row.item as string} (${row.event_nome as string})`, row.event_id as number);
+  }
+  const updated = await c.env.DB.prepare("SELECT * FROM load_rows WHERE id = ?").bind(rid).first();
+  return c.json({ success: true, row: loadRowFromRow(updated!) });
+});
+
+// ---------------------------------------------------------------------------
+// Notifiche (admin e user)
+// ---------------------------------------------------------------------------
+
+function notificationScope(me: SessionUser): [string, unknown[]] {
+  return me.role === "admin" ? ["for_admin = 1", []] : ["user_id = ?", [me.id]];
+}
+
+app.get("/api/notifications", async (c) => {
+  const me = c.get("me");
+  const [where, vals] = notificationScope(me);
+  const rows = await c.env.DB
+    .prepare(
+      `SELECT n.id, n.type, n.message, n.is_read, n.created_at, e.code AS event_code FROM notifications n
+       LEFT JOIN events e ON e.id = n.event_id WHERE ${where} ORDER BY n.created_at DESC, n.id DESC LIMIT 100`,
+    )
+    .bind(...vals)
+    .all();
+  const unread = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM notifications WHERE ${where} AND is_read = 0`).bind(...vals).first<{ n: number }>();
+  return c.json({
+    success: true,
+    unread: unread?.n ?? 0,
+    notifications: rows.results.map((r) => ({ ...r, is_read: r.is_read === 1 })),
+  });
+});
+
+app.post("/api/notifications/read-all", async (c) => {
+  const me = c.get("me");
+  const [where, vals] = notificationScope(me);
+  await c.env.DB.prepare(`UPDATE notifications SET is_read = 1 WHERE ${where}`).bind(...vals).run();
+  return c.json({ success: true });
+});
+
+app.post("/api/notifications/:nid/read", async (c) => {
+  const me = c.get("me");
+  const nid = intParam(c, "nid");
+  if (!nid) return fail(c, 400, "ID non valido");
+  const [where, vals] = notificationScope(me);
+  await c.env.DB.prepare(`UPDATE notifications SET is_read = 1 WHERE id = ? AND ${where}`).bind(nid, ...vals).run();
+  return c.json({ success: true });
+});
+
+app.all("/api/*", (c) => fail(c, 404, "Indirizzo API inesistente"));
+
 export default app;

@@ -3,7 +3,7 @@
 // e aggiunge le colonne mancanti. Non cancella mai dati: eventuali tabelle di una
 // versione vecchia e incompatibile vengono solo rinominate in "legacy_*".
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -31,15 +31,20 @@ const TABLES: string[] = [
     code TEXT NOT NULL UNIQUE,
     nome TEXT NOT NULL,
     data TEXT NOT NULL,
-    data_fine TEXT,
+    ora_ritrovo TEXT,
     ora_inizio TEXT,
     ora_fine TEXT,
     luogo TEXT,
+    tipo TEXT,
     descrizione TEXT,
     info_operative TEXT,
+    referente_nome TEXT,
+    referente_telefono TEXT,
     compenso TEXT,
     compenso_visibile INTEGER NOT NULL DEFAULT 0,
-    stato TEXT NOT NULL DEFAULT 'attivo' CHECK (stato IN ('bozza', 'attivo', 'annullato', 'chiuso')),
+    note_admin TEXT,
+    stato TEXT NOT NULL DEFAULT 'richiesta' CHECK (stato IN ('richiesta', 'da_definire', 'confermato', 'annullato', 'chiuso')),
+    motivo_annullamento TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
@@ -69,6 +74,8 @@ const TABLES: string[] = [
     returned INTEGER NOT NULL DEFAULT 0,
     damaged INTEGER NOT NULL DEFAULT 0,
     comment TEXT,
+    codice TEXT,
+    taglia TEXT,
     updated_by TEXT,
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -106,6 +113,7 @@ const USER_EXTRA_COLUMNS: Array<[string, string]> = [
   ["telefono", "TEXT"],
   ["bio", "TEXT"],
   ["note", "TEXT"],
+  ["qualifica", "TEXT"],
   ["attivo", "INTEGER NOT NULL DEFAULT 1"],
   ["competenze_json", "TEXT NOT NULL DEFAULT '[]'"],
   ["competenze_flag_json", "TEXT NOT NULL DEFAULT '[]'"],
@@ -114,9 +122,15 @@ const USER_EXTRA_COLUMNS: Array<[string, string]> = [
 // Colonna che deve esistere in una tabella per considerarla "della versione giusta".
 const REQUIRED_MARKER: Record<string, string> = {
   users: "username",
-  events: "code",
+  events: "ora_ritrovo",
   sessions: "token_hash",
 };
+
+// Colonne aggiunte nel tempo alla bolla di carico.
+const LOAD_ROW_EXTRA_COLUMNS: Array<[string, string]> = [
+  ["codice", "TEXT"],
+  ["taglia", "TEXT"],
+];
 
 const OLD_TABLES = ["availability_requests", "assignments", "tl_assignments"];
 
@@ -153,7 +167,16 @@ async function migrate(db: D1Database): Promise<void> {
   const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
   for (const [table, marker] of Object.entries(REQUIRED_MARKER)) {
     if (tables.has(table) && !(await columnNames(db, table)).has(marker)) {
-      await db.prepare(`ALTER TABLE ${table} RENAME TO legacy_${table}_${stamp}`).run();
+      const count = await db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).first<{ n: number }>();
+      if (count && count.n === 0 && table === "events") {
+        // tabella eventi della versione 3, ancora vuota: si ricrea con la nuova forma
+        await db.prepare("DROP TABLE IF EXISTS event_participants").run();
+        await db.prepare("DROP TABLE IF EXISTS load_rows").run();
+        await db.prepare("UPDATE notifications SET event_id = NULL WHERE event_id IS NOT NULL").run().catch(() => undefined);
+        await db.prepare("DROP TABLE events").run();
+      } else {
+        await db.prepare(`ALTER TABLE ${table} RENAME TO legacy_${table}_${stamp}`).run();
+      }
     }
   }
   for (const table of OLD_TABLES) {
@@ -167,6 +190,11 @@ async function migrate(db: D1Database): Promise<void> {
   const userCols = await columnNames(db, "users");
   for (const [name, def] of USER_EXTRA_COLUMNS) {
     if (!userCols.has(name)) await db.prepare(`ALTER TABLE users ADD COLUMN ${name} ${def}`).run();
+  }
+
+  const loadCols = await columnNames(db, "load_rows");
+  for (const [name, def] of LOAD_ROW_EXTRA_COLUMNS) {
+    if (!loadCols.has(name)) await db.prepare(`ALTER TABLE load_rows ADD COLUMN ${name} ${def}`).run();
   }
 
   await db
