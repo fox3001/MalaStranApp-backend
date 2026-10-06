@@ -5,15 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "check": "tsc --noEmit",
     "build": "wrangler deploy --dry-run",
-    "deploy": "wrangler deploy",
-    "db:migrate": "wrangler d1 migrations apply malastrana_db --remote"
+    "deploy": "wrangler deploy"
   },
   "dependencies": {
     "hono": "^4.9.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260831.1",
+    "typescript": "^7.0.2",
     "wrangler": "^4.33.0"
   }
 }
