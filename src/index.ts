@@ -1139,7 +1139,7 @@ async function buildResoconto(db: D1Database, eventId: number) {
   line(`BOLLA DI CARICO — voci ${sb.oggetti}, entrate ${sb.presenti}, uscite ${sb.rientrati}, danneggiate ${sb.danneggiati}, entrate ma non uscite ${sb.non_rientrati}`);
   for (const r of rows) {
     const flags = [r.prep ? "prep" : "NO prep", r.present ? "entrata" : "NO entrata", r.returned ? "uscita" : "NO uscita", r.damaged ? "DANNEGGIATO" : ""].filter(Boolean).join(", ");
-    line(`  - [${r.categoria || "-"}] ${r.quantita > 1 ? `${r.quantita}x ` : ""}${r.item}${r.codice ? ` (${r.codice})` : ""}${r.taglia ? ` tg ${r.taglia}` : ""}${r.note ? ` {${r.note}}` : ""} → ${r.assigned_name || "non assegnato"}: ${flags}${r.comment ? ` — "${r.comment}"` : ""}`);
+    line(`  - [${r.categoria || "-"}] ${r.quantita > 1 ? `${r.quantita}x ` : ""}${r.item}${r.codice ? ` (${r.codice})` : ""}${r.taglia ? ` tg ${r.taglia}` : ""}${r.note ? ` {${r.note}}` : ""}: ${flags}${r.comment ? ` — "${r.comment}"` : ""}`);
   }
   line();
   return { event, summary, people, problemi, testo: L.join("\n") };
