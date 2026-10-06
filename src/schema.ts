@@ -3,7 +3,7 @@
 // e aggiunge le colonne mancanti. Non cancella mai dati: eventuali tabelle di una
 // versione vecchia e incompatibile vengono solo rinominate in "legacy_*".
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -101,6 +101,14 @@ const TABLES: string[] = [
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
   `CREATE INDEX IF NOT EXISTS idx_user_costumes_user ON user_costumes(user_id)`,
+  `CREATE TABLE IF NOT EXISTS event_archives (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL,
+    nome TEXT NOT NULL,
+    data TEXT NOT NULL,
+    testo TEXT NOT NULL,
+    archived_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
   `CREATE TABLE IF NOT EXISTS schema_info (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL,
@@ -127,6 +135,9 @@ const REQUIRED_MARKER: Record<string, string> = {
 };
 
 // Colonne aggiunte nel tempo alla bolla di carico.
+// Colonne aggiunte nel tempo agli eventi.
+const EVENT_EXTRA_COLUMNS: Array<[string, string]> = [["note_finali", "TEXT"]];
+
 const LOAD_ROW_EXTRA_COLUMNS: Array<[string, string]> = [
   ["codice", "TEXT"],
   ["taglia", "TEXT"],
@@ -192,6 +203,10 @@ async function migrate(db: D1Database): Promise<void> {
     if (!userCols.has(name)) await db.prepare(`ALTER TABLE users ADD COLUMN ${name} ${def}`).run();
   }
 
+  const eventCols = await columnNames(db, "events");
+  for (const [name, def] of EVENT_EXTRA_COLUMNS) {
+    if (!eventCols.has(name)) await db.prepare(`ALTER TABLE events ADD COLUMN ${name} ${def}`).run();
+  }
   const loadCols = await columnNames(db, "load_rows");
   for (const [name, def] of LOAD_ROW_EXTRA_COLUMNS) {
     if (!loadCols.has(name)) await db.prepare(`ALTER TABLE load_rows ADD COLUMN ${name} ${def}`).run();

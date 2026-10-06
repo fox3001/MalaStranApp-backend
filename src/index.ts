@@ -182,6 +182,7 @@ function eventFromRow(row: Record<string, unknown>) {
     compenso: (row.compenso as string | null) ?? "",
     compenso_visibile: row.compenso_visibile === 1,
     note_admin: (row.note_admin as string | null) ?? "",
+    note_finali: (row.note_finali as string | null) ?? "",
     stato: row.stato as string,
     motivo_annullamento: (row.motivo_annullamento as string | null) ?? "",
     created_at: row.created_at as string,
@@ -551,7 +552,7 @@ app.delete("/api/admin/users/:id/costumes/:cid", async (c) => {
 
 const EVENT_FIELDS = [
   "nome", "data", "ora_ritrovo", "ora_inizio", "ora_fine", "luogo", "tipo", "descrizione", "info_operative",
-  "referente_nome", "referente_telefono", "compenso", "note_admin", "motivo_annullamento",
+  "referente_nome", "referente_telefono", "compenso", "note_admin", "motivo_annullamento", "note_finali",
 ] as const;
 
 async function eventByCode(db: D1Database, code: string) {
@@ -1024,6 +1025,164 @@ app.post("/api/notifications/:nid/read", async (c) => {
   return c.json({ success: true });
 });
 
+// ---------------------------------------------------------------------------
+// Resoconto evento e archivio
+// ---------------------------------------------------------------------------
+
+const PART_LABEL: Record<string, string> = {
+  pending: "nessuna risposta",
+  available: "disponibile (non confermato)",
+  unavailable: "non disponibile",
+  confirmed: "confermato",
+  rejected: "non selezionato",
+};
+
+async function buildResoconto(db: D1Database, eventId: number) {
+  const ev = await db.prepare("SELECT * FROM events WHERE id = ?").bind(eventId).first();
+  if (!ev) return null;
+  const event = eventFromRow(ev);
+  const people = (
+    await db
+      .prepare(
+        `SELECT p.stato, p.ruolo_evento, p.nota_user, p.responded_at, u.nome, u.cognome FROM event_participants p
+         JOIN users u ON u.id = p.user_id WHERE p.event_id = ? ORDER BY u.cognome, u.nome`,
+      )
+      .bind(eventId)
+      .all<{ stato: string; ruolo_evento: string | null; nota_user: string | null; responded_at: string | null; nome: string; cognome: string }>()
+  ).results;
+  const rows = (
+    await db
+      .prepare(
+        `SELECT l.*, u.nome AS assigned_nome, u.cognome AS assigned_cognome FROM load_rows l
+         LEFT JOIN users u ON u.id = l.assigned_user_id WHERE l.event_id = ? ORDER BY l.id`,
+      )
+      .bind(eventId)
+      .all()
+  ).results.map(loadRowFromRow);
+
+  const count = (s: string) => people.filter((p) => p.stato === s).length;
+  const summary = {
+    persone: {
+      invitati: people.length,
+      confermati: count("confirmed"),
+      disponibili_non_confermati: count("available"),
+      non_disponibili: count("unavailable"),
+      senza_risposta: count("pending"),
+      non_selezionati: count("rejected"),
+    },
+    bolla: {
+      oggetti: rows.length,
+      presenti: rows.filter((r) => r.present).length,
+      rientrati: rows.filter((r) => r.returned).length,
+      danneggiati: rows.filter((r) => r.damaged).length,
+      mai_segnati_presenti: rows.filter((r) => !r.present).length,
+      non_rientrati: rows.filter((r) => r.present && !r.returned).length,
+    },
+  };
+  const problemi = rows.filter((r) => r.damaged || r.comment || (r.present && !r.returned));
+
+  const L: string[] = [];
+  const line = (s = "") => L.push(s);
+  line("========================================================");
+  line(`EVENTO ${event.code} — ${event.nome}`);
+  line("========================================================");
+  line(`Data: ${event.data}   Orario: ${[event.ora_inizio, event.ora_fine].filter(Boolean).join("-") || "-"}   Ritrovo: ${event.ora_ritrovo || "-"}`);
+  line(`Luogo: ${event.luogo || "-"}   Tipo: ${event.tipo || "-"}   Stato: ${event.stato}`);
+  if (event.referente_nome) line(`Referente: ${event.referente_nome} ${event.referente_telefono}`);
+  if (event.compenso) line(`Compenso: ${event.compenso}`);
+  if (event.descrizione) line(`Descrizione: ${event.descrizione}`);
+  if (event.info_operative) line(`Info operative: ${event.info_operative}`);
+  if (event.note_admin) line(`Note interne: ${event.note_admin}`);
+  if (event.motivo_annullamento) line(`Motivo annullamento: ${event.motivo_annullamento}`);
+  line();
+  line(`COME È ANDATA (note finali): ${event.note_finali || "-"}`);
+  line();
+  const sp = summary.persone;
+  line(`PERSONE — invitati ${sp.invitati}, confermati ${sp.confermati}, disponibili non confermati ${sp.disponibili_non_confermati}, non disponibili ${sp.non_disponibili}, senza risposta ${sp.senza_risposta}`);
+  for (const p of people) {
+    line(`  - ${p.nome} ${p.cognome}: ${PART_LABEL[p.stato] ?? p.stato}${p.ruolo_evento ? ` [${p.ruolo_evento}]` : ""}${p.nota_user ? ` — nota: "${p.nota_user}"` : ""}`);
+  }
+  line();
+  const sb = summary.bolla;
+  line(`BOLLA DI CARICO — oggetti ${sb.oggetti}, presenti ${sb.presenti}, rientrati ${sb.rientrati}, danneggiati ${sb.danneggiati}, non rientrati ${sb.non_rientrati}`);
+  for (const r of rows) {
+    const flags = [r.present ? "presente" : "NON segnato presente", r.returned ? "rientrato" : "NON rientrato", r.damaged ? "DANNEGGIATO" : ""].filter(Boolean).join(", ");
+    line(`  - ${r.quantita > 1 ? `${r.quantita}x ` : ""}${r.item}${r.codice ? ` (${r.codice})` : ""}${r.taglia ? ` tg ${r.taglia}` : ""} → ${r.assigned_name || "non assegnato"}: ${flags}${r.comment ? ` — "${r.comment}"` : ""}`);
+  }
+  line();
+  return { event, summary, people, problemi, testo: L.join("\n") };
+}
+
+app.get("/api/admin/events/:code/resoconto", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  if (!ev) return fail(c, 404, "Evento non trovato");
+  const r = await buildResoconto(c.env.DB, ev.id as number);
+  if (!r) return fail(c, 404, "Evento non trovato");
+  const archiveDate = new Date(new Date(`${r.event.data}T12:00:00Z`).getTime() + ARCHIVE_AFTER_DAYS * 86400000).toISOString().slice(0, 10);
+  return c.json({ success: true, ...r, archivia_il: archiveDate });
+});
+
+const ARCHIVE_AFTER_DAYS = 30;
+
+async function archiveEvent(db: D1Database, eventId: number): Promise<boolean> {
+  const r = await buildResoconto(db, eventId);
+  if (!r) return false;
+  await db.prepare("INSERT INTO event_archives (code, nome, data, testo) VALUES (?, ?, ?, ?)").bind(r.event.code, r.event.nome, r.event.data, r.testo).run();
+  await db.prepare("DELETE FROM notifications WHERE event_id = ?").bind(eventId).run();
+  await db.prepare("DELETE FROM load_rows WHERE event_id = ?").bind(eventId).run();
+  await db.prepare("DELETE FROM event_participants WHERE event_id = ?").bind(eventId).run();
+  await db.prepare("DELETE FROM events WHERE id = ?").bind(eventId).run();
+  return true;
+}
+
+/** Archivia gli eventi finiti da più di 30 giorni (lanciato ogni notte da Cloudflare). */
+async function archiveOldEvents(db: D1Database): Promise<number> {
+  await ensureSchema(db);
+  const old = await db
+    .prepare("SELECT id FROM events WHERE data <= date('now', ?)")
+    .bind(`-${ARCHIVE_AFTER_DAYS} days`)
+    .all<{ id: number }>();
+  let n = 0;
+  for (const e of old.results) if (await archiveEvent(db, e.id)) n += 1;
+  return n;
+}
+
+app.post("/api/admin/events/:code/archivia", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  if (!ev) return fail(c, 404, "Evento non trovato");
+  await archiveEvent(c.env.DB, ev.id as number);
+  return c.json({ success: true });
+});
+
+app.get("/api/admin/archive", async (c) => {
+  const rows = await c.env.DB.prepare("SELECT id, code, nome, data, archived_at FROM event_archives ORDER BY data DESC, id DESC").all();
+  return c.json({ success: true, archives: rows.results });
+});
+
+app.get("/api/admin/archive/all", async (c) => {
+  const rows = await c.env.DB.prepare("SELECT testo FROM event_archives ORDER BY data, id").all<{ testo: string }>();
+  const head = `ARCHIVIO EVENTI MALASTRANA — generato il ${new Date().toISOString().slice(0, 10)} — ${rows.results.length} eventi\n\n`;
+  return c.json({ success: true, testo: head + rows.results.map((r) => r.testo).join("\n") });
+});
+
+app.get("/api/admin/archive/:id", async (c) => {
+  const id = intParam(c, "id");
+  if (!id) return fail(c, 400, "ID non valido");
+  const row = await c.env.DB.prepare("SELECT * FROM event_archives WHERE id = ?").bind(id).first();
+  if (!row) return fail(c, 404, "Archivio non trovato");
+  return c.json({ success: true, archive: row });
+});
+
 app.all("/api/*", (c) => fail(c, 404, "Indirizzo API inesistente"));
 
-export default app;
+export default {
+  fetch: app.fetch,
+  async scheduled(_event: ScheduledController, env: Bindings, ctx: ExecutionContext) {
+    ctx.waitUntil(
+      archiveOldEvents(env.DB).then(
+        (n) => console.log(`Archiviati ${n} eventi`),
+        (err) => console.error("Archiviazione fallita", err),
+      ),
+    );
+  },
+};
