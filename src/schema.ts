@@ -3,9 +3,9 @@
 // e aggiunge le colonne mancanti. Non cancella mai dati: eventuali tabelle di una
 // versione vecchia e incompatibile vengono solo rinominate in "legacy_*".
 
-import { seedVillaLongoni } from "./seed-villa-longoni";
+import { SEED_EVENT_CODE, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -214,6 +214,8 @@ async function migrate(db: D1Database): Promise<void> {
   for (const [name, def] of EVENT_EXTRA_COLUMNS) {
     if (!eventCols.has(name)) await db.prepare(`ALTER TABLE events ADD COLUMN ${name} ${def}`).run();
   }
+  const partCols = await columnNames(db, "event_participants");
+  if (!partCols.has("is_tl")) await db.prepare("ALTER TABLE event_participants ADD COLUMN is_tl INTEGER NOT NULL DEFAULT 0").run();
   const loadCols = await columnNames(db, "load_rows");
   for (const [name, def] of LOAD_ROW_EXTRA_COLUMNS) {
     if (!loadCols.has(name)) await db.prepare(`ALTER TABLE load_rows ADD COLUMN ${name} ${def}`).run();
@@ -226,6 +228,10 @@ async function migrate(db: D1Database): Promise<void> {
   tables = await tableNames(db);
   // evento di prova richiesto dall'admin (creato una sola volta, nel passaggio alla versione 6)
   if (previous > 0 && previous < 6) await seedVillaLongoni(db);
+  // richiesta dell'admin: nell'evento di prova sono team leader tutti gli user chiamati
+  if (previous > 0 && previous < 7) {
+    await db.prepare("UPDATE event_participants SET is_tl = 1 WHERE event_id = (SELECT id FROM events WHERE code = ?)").bind(SEED_EVENT_CODE).run();
+  }
 }
 
 export async function schemaStatus(db: D1Database) {

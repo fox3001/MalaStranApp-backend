@@ -686,14 +686,15 @@ app.delete("/api/admin/events/:code", async (c) => {
   return c.json({ success: true });
 });
 
-async function inviteUser(db: D1Database, eventId: number, eventName: string, userId: number, ruolo?: string | null): Promise<boolean> {
+async function inviteUser(db: D1Database, eventId: number, eventName: string, userId: number, ruolo?: string | null, isTl = false): Promise<boolean> {
   const u = await db.prepare("SELECT id FROM users WHERE id = ? AND ruolo = 'user'").bind(userId).first();
   if (!u) return false;
   const r = await db
-    .prepare("INSERT INTO event_participants (event_id, user_id, stato, ruolo_evento) VALUES (?, ?, 'pending', ?) ON CONFLICT(event_id, user_id) DO NOTHING")
-    .bind(eventId, userId, ruolo ?? null)
+    .prepare("INSERT INTO event_participants (event_id, user_id, stato, ruolo_evento, is_tl) VALUES (?, ?, 'pending', ?, ?) ON CONFLICT(event_id, user_id) DO NOTHING")
+    .bind(eventId, userId, ruolo ?? null, isTl ? 1 : 0)
     .run();
-  if (r.meta.changes) await notifyUser(db, userId, "richiesta", `Nuova richiesta di disponibilità per ${eventName}`, eventId);
+  if (r.meta.changes)
+    await notifyUser(db, userId, "richiesta", `Nuova richiesta di disponibilità per ${eventName}${isTl ? " (come team leader)" : ""}`, eventId);
   return true;
 }
 
@@ -703,7 +704,8 @@ app.post("/api/admin/events/:code/participants", async (c) => {
   const b = await body(c);
   const ids = Array.isArray(b.user_ids) ? b.user_ids.filter((x): x is number => Number.isInteger(x)) : [];
   if (!ids.length) return fail(c, 400, "Seleziona almeno uno user");
-  for (const uid of ids) await inviteUser(c.env.DB, ev.id as number, ev.nome as string, uid, str(b.ruolo_evento, 120));
+  const tl = new Set(Array.isArray(b.tl_ids) ? b.tl_ids.filter((x): x is number => Number.isInteger(x)) : []);
+  for (const uid of ids) await inviteUser(c.env.DB, ev.id as number, ev.nome as string, uid, str(b.ruolo_evento, 120), tl.has(uid));
   return c.json({ success: true });
 });
 
@@ -729,9 +731,15 @@ app.patch("/api/admin/events/:code/participants/:userId", async (c) => {
     sets.push("nota_admin = ?");
     vals.push(str(b.nota_admin, 1000));
   }
+  if (b.is_tl !== undefined) {
+    sets.push("is_tl = ?");
+    vals.push(bool(b.is_tl));
+  }
   if (!sets.length) return c.json({ success: true });
   await c.env.DB.prepare(`UPDATE event_participants SET ${sets.join(", ")} WHERE event_id = ? AND user_id = ?`).bind(...vals, ev.id, userId).run();
   if (b.stato === "confirmed" && current.stato !== "confirmed") await notifyUser(c.env.DB, userId, "confermato", `Sei stato confermato per ${ev.nome as string}`, ev.id as number);
+  if (b.is_tl !== undefined && bool(b.is_tl) && !(current as { is_tl?: number }).is_tl)
+    await notifyUser(c.env.DB, userId, "team_leader", `Sei team leader per ${ev.nome as string}: compilerai tu la bolla di carico`, ev.id as number);
   if (b.stato === "rejected" && current.stato !== "rejected") await notifyUser(c.env.DB, userId, "non_confermato", `Non sei stato selezionato per ${ev.nome as string}`, ev.id as number);
   return c.json({ success: true });
 });
@@ -892,7 +900,7 @@ app.get("/api/my/events", async (c) => {
   const me = c.get("me");
   const rows = await c.env.DB
     .prepare(
-      `SELECT e.*, p.stato AS mio_stato, p.ruolo_evento,
+      `SELECT e.*, p.stato AS mio_stato, p.ruolo_evento, p.is_tl,
         (SELECT COUNT(*) FROM load_rows l WHERE l.event_id = e.id AND l.assigned_user_id = ?) AS mie_righe
        FROM event_participants p JOIN events e ON e.id = p.event_id WHERE p.user_id = ? ORDER BY e.data, e.ora_inizio`,
     )
@@ -900,7 +908,7 @@ app.get("/api/my/events", async (c) => {
     .all();
   return c.json({
     success: true,
-    events: rows.results.map((r) => ({ ...eventForUser(r, r.mio_stato as string), mio_stato: r.mio_stato, ruolo_evento: r.ruolo_evento ?? "", mie_righe_bolla: r.mie_righe })),
+    events: rows.results.map((r) => ({ ...eventForUser(r, r.mio_stato as string), mio_stato: r.mio_stato, ruolo_evento: r.ruolo_evento ?? "", mie_righe_bolla: r.mie_righe, is_tl: r.is_tl === 1 })),
   });
 });
 
@@ -908,7 +916,7 @@ async function myParticipation(c: C, code: string) {
   const me = c.get("me");
   return c.env.DB
     .prepare(
-      `SELECT e.*, p.stato AS mio_stato, p.ruolo_evento, p.nota_user, p.nota_admin FROM events e
+      `SELECT e.*, p.stato AS mio_stato, p.ruolo_evento, p.nota_user, p.nota_admin, p.is_tl FROM events e
        JOIN event_participants p ON p.event_id = e.id WHERE e.code = ? AND p.user_id = ?`,
     )
     .bind(code, me.id)
@@ -929,14 +937,18 @@ app.get("/api/my/events/:code", async (c) => {
             .all()
         ).results
       : [];
-  const rows = await c.env.DB
-    .prepare("SELECT * FROM load_rows WHERE event_id = ? AND assigned_user_id = ? ORDER BY id")
-    .bind(row.id, me.id)
-    .all();
+  // il team leader vede e compila tutta la bolla; gli altri vedono solo cosa portano loro
+  const isTl = row.is_tl === 1 && stato !== "unavailable" && stato !== "rejected";
+  const rows = isTl
+    ? await c.env.DB
+        .prepare("SELECT l.*, u.nome AS assigned_nome, u.cognome AS assigned_cognome FROM load_rows l LEFT JOIN users u ON u.id = l.assigned_user_id WHERE l.event_id = ? ORDER BY l.id")
+        .bind(row.id)
+        .all()
+    : await c.env.DB.prepare("SELECT * FROM load_rows WHERE event_id = ? AND assigned_user_id = ? ORDER BY id").bind(row.id, me.id).all();
   return c.json({
     success: true,
     event: eventForUser(row, stato),
-    partecipazione: { stato, ruolo_evento: row.ruolo_evento ?? "", nota_user: row.nota_user ?? "", nota_admin: row.nota_admin ?? "" },
+    partecipazione: { stato, ruolo_evento: row.ruolo_evento ?? "", nota_user: row.nota_user ?? "", nota_admin: row.nota_admin ?? "", is_tl: isTl },
     team,
     load_rows: rows.results.map(loadRowFromRow),
   });
@@ -971,15 +983,15 @@ app.patch("/api/my/load-rows/:rid", async (c) => {
   if (!rid) return fail(c, 400, "ID non valido");
   const row = await c.env.DB
     .prepare(
-      `SELECT l.*, e.nome AS event_nome, e.stato AS event_stato, p.stato AS mio_stato FROM load_rows l
+      `SELECT l.*, e.nome AS event_nome, e.stato AS event_stato, p.stato AS mio_stato, p.is_tl FROM load_rows l
        JOIN events e ON e.id = l.event_id
        LEFT JOIN event_participants p ON p.event_id = l.event_id AND p.user_id = ?
        WHERE l.id = ?`,
     )
     .bind(me.id, rid)
     .first();
-  if (!row || row.assigned_user_id !== me.id) return fail(c, 403, "Questa riga della bolla non è assegnata a te");
-  if (row.mio_stato !== "confirmed") return fail(c, 403, "Puoi compilare la bolla solo dopo la conferma per l'evento");
+  if (!row) return fail(c, 404, "Riga non trovata");
+  if (row.is_tl !== 1 || row.mio_stato === "unavailable" || row.mio_stato === "rejected") return fail(c, 403, "La bolla la compila solo il team leader dell'evento");
   const b = await body(c);
   const sets: string[] = [];
   const vals: unknown[] = [];
@@ -1064,11 +1076,11 @@ async function buildResoconto(db: D1Database, eventId: number) {
   const people = (
     await db
       .prepare(
-        `SELECT p.stato, p.ruolo_evento, p.nota_user, p.responded_at, u.nome, u.cognome FROM event_participants p
+        `SELECT p.stato, p.ruolo_evento, p.nota_user, p.responded_at, p.is_tl, u.nome, u.cognome FROM event_participants p
          JOIN users u ON u.id = p.user_id WHERE p.event_id = ? ORDER BY u.cognome, u.nome`,
       )
       .bind(eventId)
-      .all<{ stato: string; ruolo_evento: string | null; nota_user: string | null; responded_at: string | null; nome: string; cognome: string }>()
+      .all<{ stato: string; ruolo_evento: string | null; nota_user: string | null; responded_at: string | null; is_tl: number; nome: string; cognome: string }>()
   ).results;
   const rows = (
     await db
@@ -1120,7 +1132,7 @@ async function buildResoconto(db: D1Database, eventId: number) {
   const sp = summary.persone;
   line(`PERSONE — invitati ${sp.invitati}, confermati ${sp.confermati}, disponibili non confermati ${sp.disponibili_non_confermati}, non disponibili ${sp.non_disponibili}, senza risposta ${sp.senza_risposta}`);
   for (const p of people) {
-    line(`  - ${p.nome} ${p.cognome}: ${PART_LABEL[p.stato] ?? p.stato}${p.ruolo_evento ? ` [${p.ruolo_evento}]` : ""}${p.nota_user ? ` — nota: "${p.nota_user}"` : ""}`);
+    line(`  - ${p.nome} ${p.cognome}${p.is_tl ? " (TEAM LEADER)" : ""}: ${PART_LABEL[p.stato] ?? p.stato}${p.ruolo_evento ? ` [${p.ruolo_evento}]` : ""}${p.nota_user ? ` — nota: "${p.nota_user}"` : ""}`);
   }
   line();
   const sb = summary.bolla;
