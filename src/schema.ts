@@ -3,7 +3,9 @@
 // e aggiunge le colonne mancanti. Non cancella mai dati: eventuali tabelle di una
 // versione vecchia e incompatibile vengono solo rinominate in "legacy_*".
 
-export const SCHEMA_VERSION = 5;
+import { seedVillaLongoni } from "./seed-villa-longoni";
+
+export const SCHEMA_VERSION = 6;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -141,6 +143,8 @@ const EVENT_EXTRA_COLUMNS: Array<[string, string]> = [["note_finali", "TEXT"]];
 const LOAD_ROW_EXTRA_COLUMNS: Array<[string, string]> = [
   ["codice", "TEXT"],
   ["taglia", "TEXT"],
+  ["note", "TEXT"],
+  ["prep", "INTEGER NOT NULL DEFAULT 0"],
 ];
 
 const OLD_TABLES = ["availability_requests", "assignments", "tl_assignments"];
@@ -169,9 +173,11 @@ export function ensureSchema(db: D1Database): Promise<void> {
 
 async function migrate(db: D1Database): Promise<void> {
   let tables = await tableNames(db);
+  let previous = 0;
   if (tables.has("schema_info")) {
     const row = await db.prepare("SELECT version FROM schema_info WHERE id = 1").first<{ version: number }>();
-    if (row && row.version >= SCHEMA_VERSION) return;
+    previous = row?.version ?? 0;
+    if (previous >= SCHEMA_VERSION) return;
   }
 
   // 1. Mette da parte (rinomina) le tabelle di versioni vecchie e incompatibili.
@@ -195,7 +201,8 @@ async function migrate(db: D1Database): Promise<void> {
   }
 
   // 2. Crea tutto ciò che manca.
-  for (const sql of TABLES) await db.prepare(sql).run();
+  // un solo invio per tutte le tabelle (Cloudflare limita il numero di richieste)
+  await db.batch(TABLES.map((sql) => db.prepare(sql)));
 
   // 3. Aggiunge le colonne mancanti agli utenti.
   const userCols = await columnNames(db, "users");
@@ -217,6 +224,8 @@ async function migrate(db: D1Database): Promise<void> {
     .bind(SCHEMA_VERSION)
     .run();
   tables = await tableNames(db);
+  // evento di prova richiesto dall'admin (creato una sola volta, nel passaggio alla versione 6)
+  if (previous > 0 && previous < 6) await seedVillaLongoni(db);
 }
 
 export async function schemaStatus(db: D1Database) {

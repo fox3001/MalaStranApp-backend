@@ -204,6 +204,8 @@ function loadRowFromRow(row: Record<string, unknown>) {
     present: row.present === 1,
     returned: row.returned === 1,
     damaged: row.damaged === 1,
+    prep: row.prep === 1,
+    note: (row.note as string | null) ?? "",
     comment: (row.comment as string | null) ?? "",
     updated_by: (row.updated_by as string | null) ?? "",
     updated_at: row.updated_at as string,
@@ -751,31 +753,49 @@ function loadRowValues(b: Record<string, unknown>) {
     categoria: str(b.categoria, 60),
     codice: str(b.codice, 60),
     taglia: str(b.taglia, 30),
+    note: str(b.note, 300),
+    prep: bool(b.prep),
     quantita: Number.isInteger(qty) && qty > 0 ? qty : 1,
     assigned: Number.isInteger(b.assigned_user_id) ? (b.assigned_user_id as number) : null,
   };
 }
+
+/** Inserisce molte righe con poche richieste al database (10 righe per istruzione). */
+export async function insertLoadRows(db: D1Database, eventId: number, rows: ReturnType<typeof loadRowValues>[]) {
+  const stmts: D1PreparedStatement[] = [];
+  for (let i = 0; i < rows.length; i += 10) {
+    const chunk = rows.slice(i, i + 10);
+    const sql = `INSERT INTO load_rows (event_id, item, categoria, codice, taglia, note, prep, quantita, assigned_user_id) VALUES ${chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)").join(", ")}`;
+    stmts.push(db.prepare(sql).bind(...chunk.flatMap((v) => [eventId, v.item, v.categoria, v.codice, v.taglia, v.note, v.prep, v.quantita, v.assigned])));
+  }
+  if (stmts.length) await db.batch(stmts);
+}
+
+app.post("/api/admin/events/:code/load-rows/assign", async (c) => {
+  const ev = await eventByCode(c.env.DB, c.req.param("code"));
+  if (!ev) return fail(c, 404, "Evento non trovato");
+  const b = await body(c);
+  const uid = Number.isInteger(b.assigned_user_id) ? (b.assigned_user_id as number) : null;
+  const cat = typeof b.categoria === "string" ? b.categoria : "";
+  const r = await c.env.DB
+    .prepare("UPDATE load_rows SET assigned_user_id = ?, updated_by = 'admin', updated_at = datetime('now') WHERE event_id = ? AND IFNULL(categoria, '') = ?")
+    .bind(uid, ev.id, cat)
+    .run();
+  if (uid) await notifyUser(c.env.DB, uid, "bolla", `Bolla di carico aggiornata per ${ev.nome as string}`, ev.id as number);
+  return c.json({ success: true, changed: r.meta.changes });
+});
 
 app.post("/api/admin/events/:code/load-rows", async (c) => {
   const ev = await eventByCode(c.env.DB, c.req.param("code"));
   if (!ev) return fail(c, 404, "Evento non trovato");
   const b = await body(c);
   const list = Array.isArray(b.rows) ? (b.rows as Record<string, unknown>[]) : [b];
-  const notified = new Set<number>();
-  let added = 0;
-  for (const raw of list.slice(0, 500)) {
-    const v = loadRowValues(raw);
-    if (!v.item) continue;
-    await c.env.DB
-      .prepare("INSERT INTO load_rows (event_id, item, categoria, codice, taglia, quantita, assigned_user_id) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .bind(ev.id, v.item, v.categoria, v.codice, v.taglia, v.quantita, v.assigned)
-      .run();
-    added += 1;
-    if (v.assigned && !notified.has(v.assigned)) {
-      notified.add(v.assigned);
-      await notifyUser(c.env.DB, v.assigned, "bolla", `Bolla di carico aggiornata per ${ev.nome as string}`, ev.id as number);
-    }
-  }
+  const valid = list.slice(0, 500).map(loadRowValues).filter((v) => v.item);
+  if (!valid.length) return fail(c, 400, "Nessuna riga valida: serve almeno il nome dell'oggetto");
+  await insertLoadRows(c.env.DB, ev.id as number, valid);
+  const added = valid.length;
+  const assigned = [...new Set(valid.map((v) => v.assigned).filter((x): x is number => x !== null))];
+  for (const uid of assigned) await notifyUser(c.env.DB, uid, "bolla", `Bolla di carico aggiornata per ${ev.nome as string}`, ev.id as number);
   if (!added) return fail(c, 400, "Nessuna riga valida: serve almeno il nome dell'oggetto");
   return c.json({ success: true, added }, 201);
 });
@@ -788,9 +808,9 @@ app.patch("/api/admin/load-rows/:rid", async (c) => {
   const b = await body(c);
   const sets: string[] = [];
   const vals: unknown[] = [];
-  for (const f of ["item", "categoria", "codice", "taglia", "comment"] as const) {
+  for (const f of ["item", "categoria", "codice", "taglia", "comment", "note"] as const) {
     if (b[f] === undefined) continue;
-    const v = str(b[f], f === "comment" ? 1000 : 160);
+    const v = str(b[f], f === "comment" ? 1000 : f === "note" ? 300 : 160);
     if (f === "item" && !v) return fail(c, 400, "Il nome dell'oggetto non può essere vuoto");
     sets.push(`${f} = ?`);
     vals.push(v);
@@ -800,7 +820,7 @@ app.patch("/api/admin/load-rows/:rid", async (c) => {
     sets.push("quantita = ?");
     vals.push(Number.isInteger(q) && q > 0 ? q : 1);
   }
-  for (const f of ["present", "returned", "damaged"] as const) {
+  for (const f of ["prep", "present", "returned", "damaged"] as const) {
     if (b[f] === undefined) continue;
     sets.push(`${f} = ?`);
     vals.push(bool(b[f]));
@@ -1104,10 +1124,10 @@ async function buildResoconto(db: D1Database, eventId: number) {
   }
   line();
   const sb = summary.bolla;
-  line(`BOLLA DI CARICO — oggetti ${sb.oggetti}, presenti ${sb.presenti}, rientrati ${sb.rientrati}, danneggiati ${sb.danneggiati}, non rientrati ${sb.non_rientrati}`);
+  line(`BOLLA DI CARICO — voci ${sb.oggetti}, entrate ${sb.presenti}, uscite ${sb.rientrati}, danneggiate ${sb.danneggiati}, entrate ma non uscite ${sb.non_rientrati}`);
   for (const r of rows) {
-    const flags = [r.present ? "presente" : "NON segnato presente", r.returned ? "rientrato" : "NON rientrato", r.damaged ? "DANNEGGIATO" : ""].filter(Boolean).join(", ");
-    line(`  - ${r.quantita > 1 ? `${r.quantita}x ` : ""}${r.item}${r.codice ? ` (${r.codice})` : ""}${r.taglia ? ` tg ${r.taglia}` : ""} → ${r.assigned_name || "non assegnato"}: ${flags}${r.comment ? ` — "${r.comment}"` : ""}`);
+    const flags = [r.prep ? "prep" : "NO prep", r.present ? "entrata" : "NO entrata", r.returned ? "uscita" : "NO uscita", r.damaged ? "DANNEGGIATO" : ""].filter(Boolean).join(", ");
+    line(`  - [${r.categoria || "-"}] ${r.quantita > 1 ? `${r.quantita}x ` : ""}${r.item}${r.codice ? ` (${r.codice})` : ""}${r.taglia ? ` tg ${r.taglia}` : ""}${r.note ? ` {${r.note}}` : ""} → ${r.assigned_name || "non assegnato"}: ${flags}${r.comment ? ` — "${r.comment}"` : ""}`);
   }
   line();
   return { event, summary, people, problemi, testo: L.join("\n") };
@@ -1143,7 +1163,7 @@ async function archiveOldEvents(db: D1Database): Promise<number> {
     .bind(`-${ARCHIVE_AFTER_DAYS} days`)
     .all<{ id: number }>();
   let n = 0;
-  for (const e of old.results) if (await archiveEvent(db, e.id)) n += 1;
+  for (const e of old.results.slice(0, 3)) if (await archiveEvent(db, e.id)) n += 1; // poche per notte: limite richieste Cloudflare
   return n;
 }
 
