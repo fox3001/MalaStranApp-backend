@@ -1106,12 +1106,21 @@ app.get("/api/taverna", async (c) => {
   // gli ultimi 300 messaggi delle ultime 24 ore, dal più vecchio al più nuovo
   const rows = await c.env.DB
     .prepare(
-      `SELECT id, author_role, user_id, author_name, testo, created_at FROM chat_messages
+      `SELECT id, author_role, user_id, author_name, testo, mentions_json, created_at FROM chat_messages
        WHERE created_at >= datetime('now', '-24 hours') ORDER BY id DESC LIMIT 300`,
     )
-    .all();
+    .all<Record<string, unknown>>();
   const me = c.get("me");
-  return c.json({ success: true, me_name: tavernaName(me), messages: rows.results.reverse() });
+  const messages = rows.results.reverse().map(({ mentions_json, ...m }) => {
+    let mentions: unknown = [];
+    try {
+      mentions = mentions_json ? JSON.parse(String(mentions_json)) : [];
+    } catch {
+      mentions = [];
+    }
+    return { ...m, mentions };
+  });
+  return c.json({ success: true, me_name: tavernaName(me), me_role: me.role, me_id: me.role === "user" ? me.id : null, messages });
 });
 
 function tavernaName(me: SessionUser) {
@@ -1139,17 +1148,25 @@ app.post("/api/taverna", async (c) => {
   if (raw.length > TAVERNA_MAX) return fail(c, 400, `Massimo ${TAVERNA_MAX} caratteri`);
   const testo = raw;
   const name = tavernaName(me);
+  // i tag arrivano già scelti dal menù: si tengono solo persone vere e presenti nel testo
+  const asked = Array.isArray(b.mentions) ? (b.mentions as Array<{ role?: unknown; id?: unknown }>) : [];
+  const low = testo.toLowerCase();
+  const mentions: Array<{ role: string; id: number | null; name: string }> = [];
+  if (asked.length) {
+    for (const p of await tavernaPeople(c.env.DB)) {
+      const wanted = asked.some((m) => m.role === p.role && (p.role === "admin" || Number(m.id) === p.id));
+      if (wanted && low.includes("@" + p.name.toLowerCase())) mentions.push(p);
+    }
+  }
   const r = await c.env.DB
-    .prepare("INSERT INTO chat_messages (author_role, user_id, author_name, testo) VALUES (?, ?, ?, ?)")
-    .bind(me.role, me.role === "user" ? me.id : null, name, testo)
+    .prepare("INSERT INTO chat_messages (author_role, user_id, author_name, testo, mentions_json) VALUES (?, ?, ?, ?, ?)")
+    .bind(me.role, me.role === "user" ? me.id : null, name, testo, mentions.length ? JSON.stringify(mentions) : null)
     .run();
-  // chi è stato taggato con @Nome riceve una notifica
-  if (testo.includes("@")) {
-    const low = testo.toLowerCase();
+  // chi è stato taggato riceve una notifica
+  if (mentions.length) {
     const snippet = testo.length > 80 ? testo.slice(0, 80) + "…" : testo;
     const msg = `${name} ti ha taggato nella Taverna: «${snippet}»`;
-    for (const p of await tavernaPeople(c.env.DB)) {
-      if (!low.includes("@" + p.name.toLowerCase())) continue;
+    for (const p of mentions) {
       if (p.role === "admin") {
         if (me.role !== "admin") await notifyAdmin(c.env.DB, "taverna", msg, null);
       } else if (p.id !== null && !(me.role === "user" && me.id === p.id)) {

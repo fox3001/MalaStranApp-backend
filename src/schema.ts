@@ -5,7 +5,7 @@
 
 import { SEED2_EVENT_CODE, SEED_EVENT_CODE, seedSecondoEvento, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -233,6 +233,8 @@ async function migrate(db: D1Database): Promise<void> {
   }
   const partCols = await columnNames(db, "event_participants");
   if (!partCols.has("is_tl")) await db.prepare("ALTER TABLE event_participants ADD COLUMN is_tl INTEGER NOT NULL DEFAULT 0").run();
+  const chatCols = await columnNames(db, "chat_messages");
+  if (!chatCols.has("mentions_json")) await db.prepare("ALTER TABLE chat_messages ADD COLUMN mentions_json TEXT").run();
   const loadCols = await columnNames(db, "load_rows");
   for (const [name, def] of LOAD_ROW_EXTRA_COLUMNS) {
     if (!loadCols.has(name)) await db.prepare(`ALTER TABLE load_rows ADD COLUMN ${name} ${def}`).run();
