@@ -293,6 +293,14 @@ app.use("/api/notifications/*", async (c, next) => {
   await next();
 });
 
+// La Taverna (chat comune) serve a entrambi.
+app.use("/api/taverna", async (c, next) => {
+  const me = await sessionFromRequest(c);
+  if (!me) return fail(c, 401, "Autenticazione richiesta");
+  c.set("me", me);
+  await next();
+});
+
 app.onError((err, c) => {
   console.error(err);
   return c.json({ success: false, error: "Errore interno del server: " + (err instanceof Error ? err.message : String(err)) }, 500);
@@ -1079,6 +1087,44 @@ function notificationScope(me: SessionUser): [string, unknown[]] {
   return me.role === "admin" ? ["for_admin = 1", []] : ["user_id = ?", [me.id]];
 }
 
+// ---------------------------------------------------------------------------
+// Taverna: un'unica chat per tutti (user e admin). Ogni messaggio sparisce dopo 24 ore.
+// ---------------------------------------------------------------------------
+
+const TAVERNA_MAX = 600;
+
+async function cleanTaverna(db: D1Database) {
+  await db.prepare("DELETE FROM chat_messages WHERE created_at < datetime('now', '-24 hours')").run();
+}
+
+app.get("/api/taverna", async (c) => {
+  await cleanTaverna(c.env.DB);
+  // gli ultimi 300 messaggi delle ultime 24 ore, dal più vecchio al più nuovo
+  const rows = await c.env.DB
+    .prepare(
+      `SELECT id, author_role, user_id, author_name, testo, created_at FROM chat_messages
+       WHERE created_at >= datetime('now', '-24 hours') ORDER BY id DESC LIMIT 300`,
+    )
+    .all();
+  return c.json({ success: true, messages: rows.results.reverse() });
+});
+
+app.post("/api/taverna", async (c) => {
+  const me = c.get("me");
+  const b = await body(c);
+  const raw = typeof b.testo === "string" ? b.testo.trim() : "";
+  if (!raw) return fail(c, 400, "Il messaggio è vuoto");
+  if (raw.length > TAVERNA_MAX) return fail(c, 400, `Massimo ${TAVERNA_MAX} caratteri`);
+  const testo = raw;
+  const name = me.role === "admin" ? "Admin" : `${me.nome} ${me.cognome}`.trim() || me.username;
+  const r = await c.env.DB
+    .prepare("INSERT INTO chat_messages (author_role, user_id, author_name, testo) VALUES (?, ?, ?, ?)")
+    .bind(me.role, me.role === "user" ? me.id : null, name, testo)
+    .run();
+  await cleanTaverna(c.env.DB);
+  return c.json({ success: true, id: r.meta.last_row_id });
+});
+
 app.get("/api/notifications", async (c) => {
   const me = c.get("me");
   const [where, vals] = notificationScope(me);
@@ -1273,5 +1319,7 @@ export default {
         (err) => console.error("Archiviazione fallita", err),
       ),
     );
+    // pulizia notturna della Taverna (i messaggi durano 24 ore)
+    ctx.waitUntil(cleanTaverna(env.DB).catch(() => undefined));
   },
 };
