@@ -460,6 +460,33 @@ app.post("/api/profile/assenze", async (c) => {
   const r = await c.env.DB.prepare("INSERT INTO user_assenze (user_id, dal, al) VALUES (?, ?, ?)").bind(me.id, dal, al).run();
   return c.json({ success: true, id: r.meta.last_row_id }, 201);
 });
+// dal calendario: un tocco su un giorno lo segna (o lo toglie); i giorni vicini diventano un unico periodo
+const addDays = (iso: string, n: number) => new Date(Date.parse(iso + "T12:00:00Z") + n * 86400000).toISOString().slice(0, 10);
+app.post("/api/profile/assenze/giorno", async (c) => {
+  const me = c.get("me");
+  const b = await body(c);
+  const day = typeof b.data === "string" ? b.data : "";
+  if (!ISO_DAY.test(day)) return fail(c, 400, "Data non valida");
+  if (day < todayRome()) return fail(c, 400, "Quel giorno è già passato");
+  const rows = await assenzeOf(c.env.DB, me.id as number);
+  const days = new Set<string>();
+  for (const r of rows) for (let d = r.dal; d <= r.al; d = addDays(d, 1)) days.add(d);
+  const away = !days.has(day);
+  if (away) days.add(day);
+  else days.delete(day);
+  // si ricostruiscono i periodi da giorni consecutivi
+  const sorted = [...days].sort();
+  const ranges: Array<[string, string]> = [];
+  for (const d of sorted) {
+    const last = ranges[ranges.length - 1];
+    if (last && addDays(last[1], 1) === d) last[1] = d;
+    else ranges.push([d, d]);
+  }
+  const stmts = [c.env.DB.prepare("DELETE FROM user_assenze WHERE user_id = ?").bind(me.id)];
+  for (const [dal, al] of ranges) stmts.push(c.env.DB.prepare("INSERT INTO user_assenze (user_id, dal, al) VALUES (?, ?, ?)").bind(me.id, dal, al));
+  await c.env.DB.batch(stmts);
+  return c.json({ success: true, away });
+});
 app.delete("/api/profile/assenze/:aid", async (c) => {
   const me = c.get("me");
   const aid = intParam(c, "aid");
@@ -768,8 +795,14 @@ app.post("/api/admin/events/:code/participants", async (c) => {
   const ids = Array.isArray(b.user_ids) ? b.user_ids.filter((x): x is number => Number.isInteger(x)) : [];
   if (!ids.length) return fail(c, 400, "Seleziona almeno uno user");
   const tl = new Set(Array.isArray(b.tl_ids) ? b.tl_ids.filter((x): x is number => Number.isInteger(x)) : []);
-  for (const uid of ids) await inviteUser(c.env.DB, ev.id as number, ev.nome as string, uid, str(b.ruolo_evento, 120), tl.has(uid));
-  return c.json({ success: true });
+  // chi ha segnato che quel giorno non c'è non viene invitato
+  const away = new Set(
+    (await c.env.DB.prepare("SELECT DISTINCT user_id FROM user_assenze WHERE dal <= ? AND al >= ?").bind(ev.data, ev.data).all<{ user_id: number }>()).results.map((r) => r.user_id),
+  );
+  const skipped = ids.filter((uid) => away.has(uid)).length;
+  if (skipped === ids.length) return fail(c, 400, "Quel giorno nessuno di loro c'è: hanno segnato di non essere disponibili");
+  for (const uid of ids.filter((u) => !away.has(u))) await inviteUser(c.env.DB, ev.id as number, ev.nome as string, uid, str(b.ruolo_evento, 120), tl.has(uid));
+  return c.json({ success: true, skipped });
 });
 
 app.patch("/api/admin/events/:code/participants/:userId", async (c) => {
