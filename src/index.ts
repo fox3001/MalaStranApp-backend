@@ -430,6 +430,45 @@ app.delete("/api/profile/costumes/:cid", async (c) => {
   return c.json({ success: true });
 });
 
+// Giorni in cui lo user non c'è (singoli giorni o periodi "dal … al …")
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+const todayRome = () => new Date(Date.now() + 2 * 3600 * 1000).toISOString().slice(0, 10);
+
+async function assenzeOf(db: D1Database, userId: number | null) {
+  // quelli già passati non servono più
+  await db.prepare("DELETE FROM user_assenze WHERE al < ?").bind(todayRome()).run();
+  const rows = userId === null
+    ? await db.prepare("SELECT id, user_id, dal, al FROM user_assenze ORDER BY dal").all<{ id: number; user_id: number; dal: string; al: string }>()
+    : await db.prepare("SELECT id, user_id, dal, al FROM user_assenze WHERE user_id = ? ORDER BY dal").bind(userId).all<{ id: number; user_id: number; dal: string; al: string }>();
+  return rows.results;
+}
+
+app.get("/api/profile/assenze", async (c) => {
+  const me = c.get("me");
+  const rows = await assenzeOf(c.env.DB, me.id as number);
+  return c.json({ success: true, assenze: rows.map(({ id, dal, al }) => ({ id, dal, al })) });
+});
+app.post("/api/profile/assenze", async (c) => {
+  const me = c.get("me");
+  const b = await body(c);
+  const dal = typeof b.dal === "string" ? b.dal : "";
+  const al = typeof b.al === "string" && b.al ? b.al : dal;
+  if (!ISO_DAY.test(dal) || !ISO_DAY.test(al)) return fail(c, 400, "Data non valida");
+  if (al < dal) return fail(c, 400, "La data di fine viene prima di quella di inizio");
+  if (al < todayRome()) return fail(c, 400, "Quel giorno è già passato");
+  if ((Date.parse(al) - Date.parse(dal)) / 86400000 > 366) return fail(c, 400, "Periodo troppo lungo (massimo un anno)");
+  const r = await c.env.DB.prepare("INSERT INTO user_assenze (user_id, dal, al) VALUES (?, ?, ?)").bind(me.id, dal, al).run();
+  return c.json({ success: true, id: r.meta.last_row_id }, 201);
+});
+app.delete("/api/profile/assenze/:aid", async (c) => {
+  const me = c.get("me");
+  const aid = intParam(c, "aid");
+  if (!aid) return fail(c, 400, "ID non valido");
+  const r = await c.env.DB.prepare("DELETE FROM user_assenze WHERE id = ? AND user_id = ?").bind(aid, me.id).run();
+  if (!r.meta.changes) return fail(c, 404, "Giorno non trovato");
+  return c.json({ success: true });
+});
+
 // ---------------------------------------------------------------------------
 // Admin: user
 // ---------------------------------------------------------------------------
@@ -439,7 +478,12 @@ app.get("/api/admin/users", async (c) => {
   const costumes = await c.env.DB.prepare("SELECT user_id, nome FROM user_costumes").all<{ user_id: number; nome: string }>();
   const byUser = new Map<number, string[]>();
   for (const cst of costumes.results) byUser.set(cst.user_id, [...(byUser.get(cst.user_id) ?? []), cst.nome]);
-  return c.json({ success: true, users: rows.results.map((r) => ({ ...userFromRow(r), costumi: byUser.get(r.id as number) ?? [] })) });
+  const away = new Map<number, Array<{ dal: string; al: string }>>();
+  for (const a of await assenzeOf(c.env.DB, null)) away.set(a.user_id, [...(away.get(a.user_id) ?? []), { dal: a.dal, al: a.al }]);
+  return c.json({
+    success: true,
+    users: rows.results.map((r) => ({ ...userFromRow(r), costumi: byUser.get(r.id as number) ?? [], assenze: away.get(r.id as number) ?? [] })),
+  });
 });
 
 app.post("/api/admin/users", async (c) => {
@@ -483,7 +527,8 @@ app.get("/api/admin/users/:id", async (c) => {
     .all();
   // solo qui (area admin) si restituisce la password leggibile, se è nota
   const pw = await c.env.DB.prepare("SELECT password_visibile FROM users WHERE id = ?").bind(id).first<{ password_visibile: string | null }>();
-  return c.json({ success: true, user: userFromRow(row), password: pw?.password_visibile ?? null, costumes: costumes.results, events: events.results });
+  const assenze = (await assenzeOf(c.env.DB, id)).map(({ dal, al }) => ({ dal, al }));
+  return c.json({ success: true, user: userFromRow(row), password: pw?.password_visibile ?? null, assenze, costumes: costumes.results, events: events.results });
 });
 
 app.patch("/api/admin/users/:id", async (c) => {
