@@ -294,12 +294,14 @@ app.use("/api/notifications/*", async (c, next) => {
 });
 
 // La Taverna (chat comune) serve a entrambi.
-app.use("/api/taverna", async (c, next) => {
+const tavernaAuth = async (c: C, next: () => Promise<void>) => {
   const me = await sessionFromRequest(c);
   if (!me) return fail(c, 401, "Autenticazione richiesta");
   c.set("me", me);
   await next();
-});
+};
+app.use("/api/taverna", tavernaAuth);
+app.use("/api/taverna/*", tavernaAuth);
 
 app.onError((err, c) => {
   console.error(err);
@@ -1108,7 +1110,25 @@ app.get("/api/taverna", async (c) => {
        WHERE created_at >= datetime('now', '-24 hours') ORDER BY id DESC LIMIT 300`,
     )
     .all();
-  return c.json({ success: true, messages: rows.results.reverse() });
+  const me = c.get("me");
+  return c.json({ success: true, me_name: tavernaName(me), messages: rows.results.reverse() });
+});
+
+function tavernaName(me: SessionUser) {
+  return me.role === "admin" ? "Admin" : `${me.nome} ${me.cognome}`.trim() || me.username;
+}
+
+// chi si può taggare con @: tutti gli user attivi più l'Admin
+async function tavernaPeople(db: D1Database) {
+  const rows = await db
+    .prepare("SELECT id, nome, cognome, username FROM users WHERE ruolo = 'user' AND attivo = 1 ORDER BY nome, cognome")
+    .all<{ id: number; nome: string; cognome: string; username: string }>();
+  const people = rows.results.map((u) => ({ id: u.id as number | null, role: "user", name: `${u.nome} ${u.cognome}`.trim() || u.username }));
+  return [{ id: null as number | null, role: "admin", name: "Admin" }, ...people];
+}
+
+app.get("/api/taverna/persone", async (c) => {
+  return c.json({ success: true, people: await tavernaPeople(c.env.DB) });
 });
 
 app.post("/api/taverna", async (c) => {
@@ -1118,11 +1138,25 @@ app.post("/api/taverna", async (c) => {
   if (!raw) return fail(c, 400, "Il messaggio è vuoto");
   if (raw.length > TAVERNA_MAX) return fail(c, 400, `Massimo ${TAVERNA_MAX} caratteri`);
   const testo = raw;
-  const name = me.role === "admin" ? "Admin" : `${me.nome} ${me.cognome}`.trim() || me.username;
+  const name = tavernaName(me);
   const r = await c.env.DB
     .prepare("INSERT INTO chat_messages (author_role, user_id, author_name, testo) VALUES (?, ?, ?, ?)")
     .bind(me.role, me.role === "user" ? me.id : null, name, testo)
     .run();
+  // chi è stato taggato con @Nome riceve una notifica
+  if (testo.includes("@")) {
+    const low = testo.toLowerCase();
+    const snippet = testo.length > 80 ? testo.slice(0, 80) + "…" : testo;
+    const msg = `${name} ti ha taggato nella Taverna: «${snippet}»`;
+    for (const p of await tavernaPeople(c.env.DB)) {
+      if (!low.includes("@" + p.name.toLowerCase())) continue;
+      if (p.role === "admin") {
+        if (me.role !== "admin") await notifyAdmin(c.env.DB, "taverna", msg, null);
+      } else if (p.id !== null && !(me.role === "user" && me.id === p.id)) {
+        await notifyUser(c.env.DB, p.id, "taverna", msg, null);
+      }
+    }
+  }
   await cleanTaverna(c.env.DB);
   return c.json({ success: true, id: r.meta.last_row_id });
 });
