@@ -150,3 +150,37 @@ export async function seedVillaLongoni(db: D1Database): Promise<void> {
   }
   await db.batch(stmts);
 }
+
+// Secondo evento di PROVA richiesto dall'admin (7 ottobre 2026): stessi orari dell'ultimo evento creato,
+// senza bolla e senza partecipanti. Creato una sola volta.
+export const SEED2_EVENT_CODE = "MAL-261127-PROVA2";
+
+export async function seedSecondoEvento(db: D1Database): Promise<void> {
+  const exists = await db.prepare("SELECT id FROM events WHERE code = ?").bind(SEED2_EVENT_CODE).first();
+  if (exists) return;
+  const last = await db
+    .prepare("SELECT ora_ritrovo, ora_inizio, ora_fine FROM events ORDER BY created_at DESC, id DESC LIMIT 1")
+    .first<{ ora_ritrovo: string | null; ora_inizio: string | null; ora_fine: string | null }>();
+  await db
+    .prepare(
+      `INSERT INTO events (code, nome, data, ora_ritrovo, ora_inizio, ora_fine, luogo, tipo, descrizione, info_operative,
+         referente_nome, referente_telefono, compenso, compenso_visibile, note_admin, stato)
+       VALUES (?, ?, '2026-11-27', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'richiesta')`,
+    )
+    .bind(
+      SEED2_EVENT_CODE,
+      "PROVA – Il Mistero di Villa Ponti",
+      last?.ora_ritrovo ?? "",
+      last?.ora_inizio ?? "",
+      last?.ora_fine ?? "",
+      "Villa Ponti, Piazza Litta 2, Varese",
+      "Omicidio a cena",
+      "Cena con delitto in costume anni '20 per circa 60 ospiti. Evento di prova creato per testare l'app.",
+      "Arrivo dal cancello laterale, parcheggio riservato nel cortile. Trucco e costumi nella sala al piano terra.",
+      "Marta Colombo",
+      "333 123 4567",
+      "90 € + rimborso benzina",
+      "Evento di prova: eliminalo quando hai finito i test.",
+    )
+    .run();
+}

@@ -3,9 +3,9 @@
 // e aggiunge le colonne mancanti. Non cancella mai dati: eventuali tabelle di una
 // versione vecchia e incompatibile vengono solo rinominate in "legacy_*".
 
-import { SEED_EVENT_CODE, seedVillaLongoni } from "./seed-villa-longoni";
+import { SEED_EVENT_CODE, seedSecondoEvento, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -234,6 +234,7 @@ async function migrate(db: D1Database): Promise<void> {
   // evento di prova richiesto dall'admin (creato una sola volta, nel passaggio alla versione 6)
   if (previous > 0 && previous < 6) await seedVillaLongoni(db);
   // richiesta dell'admin: nell'evento di prova sono team leader tutti gli user chiamati
+  if (previous > 0 && previous < 9) await seedSecondoEvento(db);
   if (previous > 0 && previous < 7) {
     await db.prepare("UPDATE event_participants SET is_tl = 1 WHERE event_id = (SELECT id FROM events WHERE code = ?)").bind(SEED_EVENT_CODE).run();
   }
