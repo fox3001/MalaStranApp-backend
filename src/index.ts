@@ -391,7 +391,7 @@ app.post("/api/profile/password", async (c) => {
   if (nuova.length < 6) return fail(c, 400, "La nuova password deve avere almeno 6 caratteri");
   const row = await c.env.DB.prepare("SELECT password_hash FROM users WHERE id = ?").bind(me.id).first<{ password_hash: string }>();
   if (!row || !(await verifyPassword(b.attuale ?? "", row.password_hash))) return fail(c, 400, "La password attuale non è corretta");
-  await c.env.DB.prepare("UPDATE users SET password_hash = ? WHERE id = ?").bind(await hashPassword(nuova), me.id).run();
+  await c.env.DB.prepare("UPDATE users SET password_hash = ?, password_visibile = ? WHERE id = ?").bind(await hashPassword(nuova), nuova, me.id).run();
   return c.json({ success: true });
 });
 
@@ -457,10 +457,10 @@ app.post("/api/admin/users", async (c) => {
   const flag = tagList(b.competenzeFlag).filter((t) => competenze.includes(t));
   const r = await c.env.DB
     .prepare(
-      `INSERT INTO users (nome, cognome, username, email, password_hash, ruolo, telefono, bio, note, qualifica, competenze_json, competenze_flag_json)
-       VALUES (?, ?, ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO users (nome, cognome, username, email, password_hash, password_visibile, ruolo, telefono, bio, note, qualifica, competenze_json, competenze_flag_json)
+       VALUES (?, ?, ?, ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?)`,
     )
-    .bind(nome, cognome, username, str(b.email, 200), await hashPassword(password), str(b.telefono, 50), str(b.bio), str(b.note), str(b.qualifica, 120), JSON.stringify(competenze), JSON.stringify(flag))
+    .bind(nome, cognome, username, str(b.email, 200), await hashPassword(password), password, str(b.telefono, 50), str(b.bio), str(b.note), str(b.qualifica, 120), JSON.stringify(competenze), JSON.stringify(flag))
     .run();
   const row = await c.env.DB.prepare(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`).bind(r.meta.last_row_id).first();
   return c.json({ success: true, user: userFromRow(row!) }, 201);
@@ -479,7 +479,9 @@ app.get("/api/admin/users/:id", async (c) => {
     )
     .bind(id)
     .all();
-  return c.json({ success: true, user: userFromRow(row), costumes: costumes.results, events: events.results });
+  // solo qui (area admin) si restituisce la password leggibile, se è nota
+  const pw = await c.env.DB.prepare("SELECT password_visibile FROM users WHERE id = ?").bind(id).first<{ password_visibile: string | null }>();
+  return c.json({ success: true, user: userFromRow(row), password: pw?.password_visibile ?? null, costumes: costumes.results, events: events.results });
 });
 
 app.patch("/api/admin/users/:id", async (c) => {
@@ -521,7 +523,7 @@ app.patch("/api/admin/users/:id/password", async (c) => {
   const password = typeof b.password === "string" ? b.password.trim() : "";
   if (!id) return fail(c, 400, "ID non valido");
   if (password.length < 6) return fail(c, 400, "La password deve avere almeno 6 caratteri");
-  const r = await c.env.DB.prepare("UPDATE users SET password_hash = ? WHERE id = ? AND ruolo = 'user'").bind(await hashPassword(password), id).run();
+  const r = await c.env.DB.prepare("UPDATE users SET password_hash = ?, password_visibile = ? WHERE id = ? AND ruolo = 'user'").bind(await hashPassword(password), password, id).run();
   if (!r.meta.changes) return fail(c, 404, "User non trovato");
   await c.env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id).run();
   return c.json({ success: true });

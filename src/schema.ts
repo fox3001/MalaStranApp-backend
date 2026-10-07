@@ -5,7 +5,7 @@
 
 import { SEED2_EVENT_CODE, SEED_EVENT_CODE, seedSecondoEvento, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -136,6 +136,8 @@ const USER_EXTRA_COLUMNS: Array<[string, string]> = [
   ["attivo", "INTEGER NOT NULL DEFAULT 1"],
   ["competenze_json", "TEXT NOT NULL DEFAULT '[]'"],
   ["competenze_flag_json", "TEXT NOT NULL DEFAULT '[]'"],
+  // richiesta dell'admin: poter rivedere la password degli user (salvata leggibile, solo l'admin la vede)
+  ["password_visibile", "TEXT"],
 ];
 
 // Colonna che deve esistere in una tabella per considerarla "della versione giusta".
