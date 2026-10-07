@@ -3,9 +3,9 @@
 // e aggiunge le colonne mancanti. Non cancella mai dati: eventuali tabelle di una
 // versione vecchia e incompatibile vengono solo rinominate in "legacy_*".
 
-import { SEED_EVENT_CODE, seedSecondoEvento, seedVillaLongoni } from "./seed-villa-longoni";
+import { SEED2_EVENT_CODE, SEED_EVENT_CODE, seedSecondoEvento, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -142,6 +142,7 @@ const EVENT_EXTRA_COLUMNS: Array<[string, string]> = [
   ["note_finali", "TEXT"],
   ["chiuso_da", "TEXT"],
   ["chiuso_at", "TEXT"],
+  ["tematica", "TEXT"],
 ];
 
 const LOAD_ROW_EXTRA_COLUMNS: Array<[string, string]> = [
@@ -235,6 +236,13 @@ async function migrate(db: D1Database): Promise<void> {
   if (previous > 0 && previous < 6) await seedVillaLongoni(db);
   // richiesta dell'admin: nell'evento di prova sono team leader tutti gli user chiamati
   if (previous > 0 && previous < 9) await seedSecondoEvento(db);
+  // richiesta dell'admin: agli eventi di prova si dà solo una tematica (è quella che vedono gli user nel calendario)
+  if (previous > 0 && previous < 10) {
+    await db.batch([
+      db.prepare("UPDATE events SET tematica = 'Medievale' WHERE code = ? AND (tematica IS NULL OR tematica = '')").bind(SEED_EVENT_CODE),
+      db.prepare("UPDATE events SET tematica = 'Pirata' WHERE code = ? AND (tematica IS NULL OR tematica = '')").bind(SEED2_EVENT_CODE),
+    ]);
+  }
   if (previous > 0 && previous < 7) {
     await db.prepare("UPDATE event_participants SET is_tl = 1 WHERE event_id = (SELECT id FROM events WHERE code = ?)").bind(SEED_EVENT_CODE).run();
   }

@@ -175,6 +175,7 @@ function eventFromRow(row: Record<string, unknown>) {
     ora_fine: (row.ora_fine as string | null) ?? "",
     luogo: (row.luogo as string | null) ?? "",
     tipo: (row.tipo as string | null) ?? "",
+    tematica: (row.tematica as string | null) ?? "",
     descrizione: (row.descrizione as string | null) ?? "",
     info_operative: (row.info_operative as string | null) ?? "",
     referente_nome: (row.referente_nome as string | null) ?? "",
@@ -556,7 +557,7 @@ app.delete("/api/admin/users/:id/costumes/:cid", async (c) => {
 // ---------------------------------------------------------------------------
 
 const EVENT_FIELDS = [
-  "nome", "data", "ora_ritrovo", "ora_inizio", "ora_fine", "luogo", "tipo", "descrizione", "info_operative",
+  "nome", "data", "ora_ritrovo", "ora_inizio", "ora_fine", "luogo", "tipo", "tematica", "descrizione", "info_operative",
   "referente_nome", "referente_telefono", "compenso", "note_admin", "motivo_annullamento", "note_finali",
 ] as const;
 
@@ -941,7 +942,7 @@ function eventForUser(row: Record<string, unknown>, myStato: string) {
   const showFee = e.compenso_visibile && myStato === "confirmed";
   return {
     id: e.id, code: e.code, nome: e.nome, data: e.data, ora_ritrovo: e.ora_ritrovo, ora_inizio: e.ora_inizio, ora_fine: e.ora_fine,
-    luogo: e.luogo, tipo: e.tipo, descrizione: e.descrizione, stato: e.stato, motivo_annullamento: e.motivo_annullamento,
+    luogo: e.luogo, tipo: e.tipo, tematica: e.tematica, descrizione: e.descrizione, stato: e.stato, motivo_annullamento: e.motivo_annullamento,
     // informazioni operative e referente solo a chi è confermato
     info_operative: myStato === "confirmed" ? e.info_operative : "",
     referente_nome: myStato === "confirmed" ? e.referente_nome : "",
@@ -1174,7 +1175,7 @@ async function buildResoconto(db: D1Database, eventId: number) {
   line(`EVENTO ${event.code} — ${event.nome}`);
   line("========================================================");
   line(`Data: ${event.data}   Orario: ${[event.ora_inizio, event.ora_fine].filter(Boolean).join("-") || "-"}   Ritrovo: ${event.ora_ritrovo || "-"}`);
-  line(`Luogo: ${event.luogo || "-"}   Tipo: ${event.tipo || "-"}   Stato: ${event.stato}`);
+  line(`Luogo: ${event.luogo || "-"}   Tipo: ${event.tipo || "-"}   Tematica: ${event.tematica || "-"}   Stato: ${event.stato}`);
   if (event.referente_nome) line(`Referente: ${event.referente_nome} ${event.referente_telefono}`);
   if (event.compenso) line(`Compenso: ${event.compenso}`);
   if (event.descrizione) line(`Descrizione: ${event.descrizione}`);
