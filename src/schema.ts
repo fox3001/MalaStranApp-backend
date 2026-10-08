@@ -5,7 +5,7 @@
 
 import { SEED2_EVENT_CODE, SEED_EVENT_CODE, seedSecondoEvento, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -175,6 +175,19 @@ const TABLES: string[] = [
     closed_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (user_id, mese)
   )`,
+  `CREATE TABLE IF NOT EXISTS attivita_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    testo TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS chat_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    author_role TEXT NOT NULL,
+    author_name TEXT NOT NULL,
+    testo TEXT NOT NULL,
+    mentions_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
   `CREATE TABLE IF NOT EXISTS monthly_reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mese TEXT NOT NULL,
@@ -313,6 +326,13 @@ async function migrate(db: D1Database): Promise<void> {
   // richiesta dell'admin: nell'evento di prova sono team leader tutti gli user chiamati
   if (previous > 0 && previous < 9) await seedSecondoEvento(db);
   // richiesta dell'admin: agli eventi di prova si dà solo una tematica (è quella che vedono gli user nel calendario)
+  if (previous > 0 && previous < 18) {
+    // i messaggi dell'admin già salvati passano nel nuovo registro della chat (che ora tiene anche quelli degli user)
+    await db
+      .prepare("INSERT INTO chat_log (author_role, author_name, testo, mentions_json, created_at) SELECT 'admin', 'Admin', testo, mentions_json, created_at FROM taverna_admin_log")
+      .run()
+      .catch(() => undefined);
+  }
   if (previous > 0 && previous < 17) {
     // la sigla (es. "OaC6") si ricava dal nome degli eventi già esistenti
     const evs = await db.prepare("SELECT id, nome FROM events WHERE sigla IS NULL OR sigla = ''").all<{ id: number; nome: string }>();

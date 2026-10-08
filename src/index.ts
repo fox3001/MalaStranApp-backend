@@ -260,6 +260,105 @@ app.use("/api/*", async (c, next) => {
   await next();
 });
 
+// ---------------------------------------------------------------------------
+// Registro attività: dopo ogni modifica riuscita si annota chi ha fatto cosa (finisce nel report del mese).
+// ---------------------------------------------------------------------------
+
+const FIELD_LABEL: Record<string, string> = {
+  nome: "nome", cognome: "cognome", email: "email", telefono: "telefono", bio: "presentazione", note: "note interne", qualifica: "qualifica",
+  competenze: "competenze", competenzeFlag: "competenze principali", attivo: "stato account", data: "data", ora_ritrovo: "ritrovo", ora_inizio: "inizio",
+  ora_fine: "fine", luogo: "luogo", tipo: "tipo", tematica: "tematica", sigla: "sigla", descrizione: "descrizione", info_operative: "info operative",
+  referente_nome: "referente", referente_telefono: "telefono referente", compenso: "compenso", compenso_visibile: "compenso visibile", note_admin: "note interne",
+  note_finali: "note finali", stato: "stato", motivo_annullamento: "motivo annullamento",
+};
+const STATO_LABEL: Record<string, string> = { pending: "in attesa", available: "disponibile", unavailable: "non disponibile", confirmed: "confermato", rejected: "non selezionato" };
+const dmy = (iso: string) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}`;
+
+async function logAct(db: D1Database, testo: string) {
+  await db.prepare("INSERT INTO attivita_log (testo) VALUES (?)").bind(testo).run();
+}
+async function userName(db: D1Database, id: unknown) {
+  const u = await db.prepare("SELECT nome, cognome, username FROM users WHERE id = ?").bind(Number(id)).first<{ nome: string; cognome: string; username: string }>();
+  return u ? `${u.nome} ${u.cognome}`.trim() || u.username : `user n. ${String(id)}`;
+}
+async function eventName(db: D1Database, code: string) {
+  const e = await db.prepare("SELECT nome, data FROM events WHERE code = ?").bind(code).first<{ nome: string; data: string }>();
+  return e ? `«${e.nome}» del ${dmy(e.data)}` : `evento ${code}`;
+}
+const campi = (b: Record<string, unknown>) =>
+  Object.keys(b)
+    .map((k) => FIELD_LABEL[k])
+    .filter(Boolean)
+    .filter((v, i, a) => a.indexOf(v) === i)
+    .join(", ");
+
+app.use("/api/*", async (c, next) => {
+  const method = c.req.method;
+  if (method === "GET" || method === "OPTIONS") return next();
+  const path = c.req.path;
+  // per ciò che viene cancellato, il nome si legge prima
+  let before = "";
+  try {
+    let m: RegExpExecArray | null;
+    if (method === "DELETE" && (m = /^\/api\/admin\/users\/(\d+)$/.exec(path))) before = await userName(c.env.DB, m[1]);
+    else if (method === "DELETE" && (m = /^\/api\/admin\/events\/([^/]+)$/.exec(path))) before = await eventName(c.env.DB, decodeURIComponent(m[1]!));
+    else if (method === "DELETE" && (m = /^\/api\/admin\/events\/([^/]+)\/participants\/(\d+)$/.exec(path)))
+      before = `${await userName(c.env.DB, m[2])} da ${await eventName(c.env.DB, decodeURIComponent(m[1]!))}`;
+  } catch {
+    /* il registro non deve mai bloccare l'app */
+  }
+  await next();
+  if (c.res.status >= 400) return;
+  try {
+    const db = c.env.DB;
+    const me = c.get("me") as SessionUser | undefined;
+    const who = me ? (me.role === "admin" ? "Admin" : `${me.nome} ${me.cognome}`.trim()) : "";
+    const b = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    let m: RegExpExecArray | null;
+    let t = "";
+    if (method === "POST" && path === "/api/admin/users") t = `Admin ha creato lo user ${String(b.nome ?? "")} ${String(b.cognome ?? "")}`;
+    else if (method === "PATCH" && (m = /^\/api\/admin\/users\/(\d+)$/.exec(path))) {
+      const n = await userName(db, m[1]);
+      if (b.attivo !== undefined && Object.keys(b).length === 1) t = `Admin ha ${b.attivo ? "riattivato" : "disattivato"} l'account di ${n}`;
+      else t = `Admin ha modificato la scheda di ${n}${campi(b) ? ` (${campi(b)})` : ""}`;
+    } else if (method === "PATCH" && (m = /^\/api\/admin\/users\/(\d+)\/password$/.exec(path))) t = `Admin ha impostato una nuova password per ${await userName(db, m[1])}`;
+    else if (method === "DELETE" && /^\/api\/admin\/users\/\d+$/.test(path)) t = `Admin ha eliminato lo user ${before}`;
+    else if (method === "PATCH" && path === "/api/profile") t = `${who} ha modificato la sua scheda${campi(b) ? ` (${campi(b)})` : ""}`;
+    else if (method === "POST" && path === "/api/profile/password") t = `${who} ha cambiato la sua password`;
+    else if (method === "POST" && path === "/api/profile/assenze/giorno") {
+      const r = (await c.res.clone().json().catch(() => ({}))) as { away?: boolean };
+      t = `${who} ha ${r.away ? "segnato che NON c'è" : "tolto il segno di assenza"} il ${dmy(String(b.data ?? ""))}`;
+    } else if (method === "POST" && path === "/api/profile/assenze") t = `${who} ha segnato che non c'è dal ${dmy(String(b.dal ?? ""))} al ${dmy(String(b.al || b.dal || ""))}`;
+    else if (method === "DELETE" && /^\/api\/profile\/assenze\/\d+$/.test(path)) t = `${who} ha tolto un periodo in cui non c'era`;
+    else if (method === "POST" && path === "/api/admin/events") t = `Admin ha creato l'evento «${String(b.nome ?? "")}» del ${dmy(String(b.data ?? ""))}`;
+    else if (method === "PATCH" && (m = /^\/api\/admin\/events\/([^/]+)$/.exec(path)))
+      t = `Admin ha modificato l'evento ${await eventName(db, decodeURIComponent(m[1]!))}${campi(b) ? ` (${campi(b)})` : ""}${b.stato ? ` — stato: ${String(b.stato)}` : ""}`;
+    else if (method === "DELETE" && /^\/api\/admin\/events\/[^/]+$/.test(path)) t = `Admin ha eliminato l'evento ${before}`;
+    else if (method === "POST" && (m = /^\/api\/admin\/events\/([^/]+)\/participants$/.exec(path))) {
+      const ids = Array.isArray(b.user_ids) ? b.user_ids : [];
+      const names = [];
+      for (const id of ids) names.push(await userName(db, id));
+      t = `Admin ha invitato ${names.join(", ")} all'evento ${await eventName(db, decodeURIComponent(m[1]!))}`;
+    } else if (method === "PATCH" && (m = /^\/api\/admin\/events\/([^/]+)\/participants\/(\d+)$/.exec(path))) {
+      const n = await userName(db, m[2]);
+      const ev = await eventName(db, decodeURIComponent(m[1]!));
+      if (b.stato) t = `Admin: ${n} ${STATO_LABEL[String(b.stato)] ?? String(b.stato)} per l'evento ${ev}`;
+      else if (b.is_tl !== undefined) t = `Admin: ${n} ${b.is_tl ? "è" : "non è più"} team leader per l'evento ${ev}`;
+      else if (b.ruolo_evento !== undefined) t = `Admin: ruolo di ${n} per l'evento ${ev}: ${String(b.ruolo_evento || "-")}`;
+    } else if (method === "DELETE" && /^\/api\/admin\/events\/[^/]+\/participants\/\d+$/.test(path)) t = `Admin ha tolto ${before}`;
+    else if (method === "POST" && (m = /^\/api\/my\/events\/([^/]+)\/availability$/.exec(path)))
+      t = `${who} ha risposto «${STATO_LABEL[String(b.stato)] ?? String(b.stato)}» per l'evento ${await eventName(db, decodeURIComponent(m[1]!))}${b.nota ? ` — nota: "${String(b.nota)}"` : ""}`;
+    else if (method === "POST" && (m = /^\/api\/(admin|my)\/events\/([^/]+)\/chiudi$/.exec(path))) t = `${who} ha chiuso l'evento ${await eventName(db, decodeURIComponent(m[2]!))}`;
+    else if (method === "POST" && (m = /^\/api\/admin\/events\/([^/]+)\/riapri$/.exec(path))) t = `Admin ha riaperto l'evento ${await eventName(db, decodeURIComponent(m[1]!))}`;
+    else if (method === "PUT" && (m = /^\/api\/my\/presenze\/([^/]+)$/.exec(path)))
+      t = `${who} ha compilato il foglio presenza per l'evento ${await eventName(db, decodeURIComponent(m[1]!))}: ruolo ${String(b.ruolo || "-")}, tariffa ${String(b.tariffa || "-")}${b.diaria ? `, diaria ${String(b.diaria)}` : ""}${b.pernotti ? `, pernotti ${String(b.pernotti)}` : ""}${b.viaggi ? `, viaggi ${String(b.viaggi)}` : ""}`;
+    else if (method === "POST" && (m = /^\/api\/my\/fogli\/(\d{4}-\d{2})\/chiudi$/.exec(path))) t = `${who} ha chiuso il suo foglio presenze di ${m[1]}`;
+    if (t) await logAct(db, t);
+  } catch {
+    /* il registro non deve mai bloccare l'app */
+  }
+});
+
 // Tutte le rotte /api/admin/* richiedono l'admin.
 app.use("/api/admin/*", async (c, next) => {
   const me = await sessionFromRequest(c);
@@ -439,11 +538,12 @@ const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
 const todayRome = () => new Date(Date.now() + 2 * 3600 * 1000).toISOString().slice(0, 10);
 
 async function assenzeOf(db: D1Database, userId: number | null) {
-  // quelli già passati non servono più
-  await db.prepare("DELETE FROM user_assenze WHERE al < ?").bind(todayRome()).run();
+  // quelli passati da più di un anno si cancellano; quelli già passati non si mostrano più (restano per il report del mese)
+  await db.prepare("DELETE FROM user_assenze WHERE al < date('now', '-400 days')").run();
+  const today = todayRome();
   const rows = userId === null
-    ? await db.prepare("SELECT id, user_id, dal, al FROM user_assenze ORDER BY dal").all<{ id: number; user_id: number; dal: string; al: string }>()
-    : await db.prepare("SELECT id, user_id, dal, al FROM user_assenze WHERE user_id = ? ORDER BY dal").bind(userId).all<{ id: number; user_id: number; dal: string; al: string }>();
+    ? await db.prepare("SELECT id, user_id, dal, al FROM user_assenze WHERE al >= ? ORDER BY dal").bind(today).all<{ id: number; user_id: number; dal: string; al: string }>()
+    : await db.prepare("SELECT id, user_id, dal, al FROM user_assenze WHERE user_id = ? AND al >= ? ORDER BY dal").bind(userId, today).all<{ id: number; user_id: number; dal: string; al: string }>();
   return rows.results;
 }
 
@@ -486,7 +586,8 @@ app.post("/api/profile/assenze/giorno", async (c) => {
     if (last && addDays(last[1], 1) === d) last[1] = d;
     else ranges.push([d, d]);
   }
-  const stmts = [c.env.DB.prepare("DELETE FROM user_assenze WHERE user_id = ?").bind(me.id)];
+  // si riscrivono solo i periodi che arrivano da oggi in poi: quelli passati restano per il report
+  const stmts = [c.env.DB.prepare("DELETE FROM user_assenze WHERE user_id = ? AND al >= ?").bind(me.id, todayRome())];
   for (const [dal, al] of ranges) stmts.push(c.env.DB.prepare("INSERT INTO user_assenze (user_id, dal, al) VALUES (?, ?, ?)").bind(me.id, dal, al));
   await c.env.DB.batch(stmts);
   return c.json({ success: true, away });
@@ -1392,10 +1493,11 @@ app.post("/api/taverna", async (c) => {
     .prepare("INSERT INTO chat_messages (author_role, user_id, author_name, testo, mentions_json) VALUES (?, ?, ?, ?, ?)")
     .bind(me.role, me.role === "user" ? me.id : null, name, testo, mentions.length ? JSON.stringify(mentions) : null)
     .run();
-  // i messaggi dell'admin restano salvati per il report del mese (la chat invece si svuota dopo 24 ore)
-  if (me.role === "admin") {
-    await c.env.DB.prepare("INSERT INTO taverna_admin_log (testo, mentions_json) VALUES (?, ?)").bind(testo, mentions.length ? JSON.stringify(mentions) : null).run();
-  }
+  // tutti i messaggi restano salvati per il report del mese (la chat invece si svuota dopo 24 ore)
+  await c.env.DB
+    .prepare("INSERT INTO chat_log (author_role, author_name, testo, mentions_json) VALUES (?, ?, ?, ?)")
+    .bind(me.role, name, testo, mentions.length ? JSON.stringify(mentions) : null)
+    .run();
   // chi è stato taggato riceve una notifica
   if (mentions.length) {
     const snippet = testo.length > 80 ? testo.slice(0, 80) + "…" : testo;
@@ -1678,14 +1780,18 @@ const romeMonth = (sql: string) => new Date(sql.replace(" ", "T") + "Z").toLocal
 
 async function buildMonthlyReport(db: D1Database, mese: string) {
   const [y, m] = mese.split("-").map(Number) as [number, number];
+  const first = `${mese}-01`;
+  const last = lastDayOf(mese);
   const SEP = "=".repeat(64);
   const sub = "-".repeat(64);
   const out: string[] = [];
-  const head = (t: string) => out.push("", SEP, t, SEP, "");
+  let n = 0;
+  const head = (t: string) => out.push("", SEP, `${++n}. ${t}`, SEP, "");
+  const inMonth = (sql: string) => romeMonth(sql) === mese;
 
-  // eventi del mese: quelli ancora nell'app si leggono per intero, quelli già archiviati dal loro resoconto salvato
+  // eventi con data nel mese: quelli ancora nell'app si leggono per intero, quelli già archiviati dal loro resoconto
   const live = await db.prepare("SELECT id, code FROM events WHERE substr(data, 1, 7) = ? ORDER BY data, id").bind(mese).all<{ id: number; code: string }>();
-  const archived = await db.prepare("SELECT code, nome, data, testo FROM event_archives WHERE substr(data, 1, 7) = ? ORDER BY data, id").bind(mese).all<{ code: string; nome: string; data: string; testo: string }>();
+  const archived = await db.prepare("SELECT code, testo FROM event_archives WHERE substr(data, 1, 7) = ? ORDER BY data, id").bind(mese).all<{ code: string; testo: string }>();
   const reso = [];
   for (const e of live.results) {
     const r = await buildResoconto(db, e.id);
@@ -1694,53 +1800,112 @@ async function buildMonthlyReport(db: D1Database, mese: string) {
   const liveCodes = new Set(reso.map((r) => r.event.code));
   const oldOnes = archived.results.filter((a) => !liveCodes.has(a.code));
 
+  // eventi CREATI nel mese ma con data in un altro mese
+  const created = (await db.prepare("SELECT id, created_at FROM events WHERE substr(data, 1, 7) != ? ORDER BY data, id").bind(mese).all<{ id: number; created_at: string }>()).results.filter((e) =>
+    inMonth(e.created_at),
+  );
+  const createdReso = [];
+  for (const e of created) {
+    const r = await buildResoconto(db, e.id);
+    if (r) createdReso.push(r);
+  }
+
   const people = new Map<string, number>();
   for (const r of reso) for (const p of r.people) if (p.stato === "confirmed") people.set(`${p.nome} ${p.cognome}`, (people.get(`${p.nome} ${p.cognome}`) ?? 0) + 1);
   const issues = reso.flatMap((r) => r.problemi.filter((x) => x.damaged || x.lost).map((x) => ({ ev: r.event, row: x })));
 
-  const shouts = (await db.prepare("SELECT id, testo, a_tutti, created_at FROM shouts ORDER BY id").all<{ id: number; testo: string; a_tutti: number; created_at: string }>()).results.filter(
-    (s) => romeMonth(s.created_at) === mese,
+  // giorni di non disponibilità che toccano il mese
+  const away = await db
+    .prepare(
+      `SELECT a.dal, a.al, u.nome, u.cognome FROM user_assenze a JOIN users u ON u.id = a.user_id
+       WHERE a.dal <= ? AND a.al >= ? ORDER BY u.cognome, u.nome, a.dal`,
+    )
+    .bind(last, first)
+    .all<{ dal: string; al: string; nome: string; cognome: string }>();
+
+  // fogli presenze: chiusi + ancora aperti
+  const users = (await db.prepare("SELECT id, nome, cognome FROM users WHERE ruolo = 'user' ORDER BY cognome, nome").all<{ id: number; nome: string; cognome: string }>()).results;
+  const closed = await db.prepare("SELECT user_id, nome, cognome, righe_json, closed_at FROM fogli_presenza WHERE mese = ?").bind(mese).all<{ user_id: number; nome: string; cognome: string; righe_json: string; closed_at: string }>();
+  const closedBy = new Map(closed.results.map((r) => [r.user_id, r]));
+  const fogli: Array<{ nome: string; stato: string; righe: FpRow[] }> = [];
+  for (const u of users) {
+    const cl = closedBy.get(u.id);
+    if (cl) fogli.push({ nome: `${cl.nome} ${cl.cognome}`, stato: `chiuso il ${romeDateTime(cl.closed_at)}`, righe: JSON.parse(cl.righe_json) as FpRow[] });
+    else {
+      const righe = await foglioRighe(db, u.id, mese);
+      if (righe.length) fogli.push({ nome: `${u.nome} ${u.cognome}`, stato: "NON ancora chiuso dallo user", righe });
+    }
+  }
+  for (const cl of closed.results) if (!users.some((u) => u.id === cl.user_id)) fogli.push({ nome: `${cl.nome} ${cl.cognome}`, stato: `chiuso il ${romeDateTime(cl.closed_at)} (user non più presente)`, righe: JSON.parse(cl.righe_json) as FpRow[] });
+
+  const shouts = (await db.prepare("SELECT id, testo, a_tutti, created_at FROM shouts ORDER BY id").all<{ id: number; testo: string; a_tutti: number; created_at: string }>()).results.filter((x) => inMonth(x.created_at));
+  const chat = (await db.prepare("SELECT author_role, author_name, testo, mentions_json, created_at FROM chat_log ORDER BY id").all<{ author_role: string; author_name: string; testo: string; mentions_json: string | null; created_at: string }>()).results.filter((x) =>
+    inMonth(x.created_at),
   );
-  const tav = (await db.prepare("SELECT testo, mentions_json, created_at FROM taverna_admin_log ORDER BY id").all<{ testo: string; mentions_json: string | null; created_at: string }>()).results.filter(
-    (t) => romeMonth(t.created_at) === mese,
-  );
+  const log = (await db.prepare("SELECT testo, created_at FROM attivita_log ORDER BY id").all<{ testo: string; created_at: string }>()).results.filter((x) => inMonth(x.created_at));
 
   out.push(`REPORT DEL MESE — MALASTRANA EVENTI — ${MESI[m - 1]!.toUpperCase()} ${y}`);
   out.push(`Generato il ${romeDateTime(new Date().toISOString().slice(0, 19).replace("T", " "))}`);
 
   head("RIEPILOGO");
   out.push(`Eventi del mese: ${reso.length + oldOnes.length}`);
+  out.push(`Eventi creati nel mese per altri mesi: ${createdReso.length}`);
   out.push(`Persone che hanno lavorato (confermate): ${people.size}`);
   out.push(`Oggetti danneggiati: ${issues.filter((i) => i.row.damaged).length}`);
   out.push(`Oggetti persi: ${issues.filter((i) => i.row.lost).length}`);
+  out.push(`Periodi di non disponibilità segnati: ${away.results.length}`);
+  out.push(`Fogli presenze: ${fogli.length} (chiusi ${fogli.filter((f) => f.stato.startsWith("chiuso")).length})`);
   out.push(`Shout mandati: ${shouts.length}`);
-  out.push(`Messaggi dell'admin in Taverna: ${tav.length}`);
+  out.push(`Messaggi in Taverna: ${chat.length}`);
+  out.push(`Attività registrate: ${log.length}`);
 
-  head("1. EVENTI DEL MESE");
+  head("EVENTI DEL MESE (con tutte le info, persone e bolla)");
   if (!reso.length && !oldOnes.length) out.push("Nessun evento in questo mese.");
-  reso.forEach((r, i) => {
+  [...reso.map((r) => r.testo), ...oldOnes.map((a) => a.testo)].forEach((tx, i) => {
+    if (i) out.push(sub, "");
+    out.push(tx);
+  });
+
+  head("EVENTI CREATI NEL MESE PER I MESI SUCCESSIVI (o precedenti)");
+  if (!createdReso.length) out.push("Nessuno.");
+  createdReso.forEach((r, i) => {
     if (i) out.push(sub, "");
     out.push(r.testo);
   });
-  oldOnes.forEach((a, i) => {
-    if (i || reso.length) out.push(sub, "");
-    out.push(a.testo);
-  });
 
-  head("2. CHI HA LAVORATO NEL MESE");
+  head("CHI HA LAVORATO NEL MESE");
   if (!people.size) out.push("Nessuno confermato in questo mese.");
-  for (const [n, k] of [...people.entries()].sort((a, b) => a[0].localeCompare(b[0]))) out.push(`  - ${n}: ${k} ${k === 1 ? "evento" : "eventi"}`);
+  for (const [nm, k] of [...people.entries()].sort((a, b) => a[0].localeCompare(b[0]))) out.push(`  - ${nm}: ${k} ${k === 1 ? "evento" : "eventi"}`);
 
-  head("3. DANNI E PERDITE");
+  head("DANNI E PERDITE");
   if (!issues.length) out.push("Nessun oggetto danneggiato o perso." + (oldOnes.length ? " (Per gli eventi già archiviati vedi il loro resoconto sopra.)" : ""));
   for (const { ev, row } of issues) {
     const what = [row.damaged ? "DANNEGGIATO" : "", row.lost ? "PERSO" : ""].filter(Boolean).join(" + ");
-    out.push(`  - ${ev.data} ${ev.nome}: ${row.quantita > 1 ? `${row.quantita}x ` : ""}${row.item}${row.codice ? ` (${row.codice})` : ""} — ${what}${row.assigned_name ? ` — affidato a ${row.assigned_name}` : ""}`);
+    out.push(`  - ${dmy(ev.data)} ${ev.nome}: ${row.quantita > 1 ? `${row.quantita}x ` : ""}${row.item}${row.codice ? ` (${row.codice})` : ""} — ${what}${row.assigned_name ? ` — affidato a ${row.assigned_name}` : ""}`);
     if (row.comment) out.push(`      cosa è successo: "${row.comment}"${row.updated_by ? ` (segnato da ${row.updated_by})` : ""}`);
     if (row.annotazione) out.push(`      annotazione admin: ${row.annotazione}`);
   }
 
-  head("4. SHOUT DELL'ADMIN");
+  head("GIORNI IN CUI GLI USER NON C'ERANO");
+  if (!away.results.length) out.push("Nessuno ha segnato giorni di non disponibilità in questo mese.");
+  for (const a of away.results) {
+    const dal = a.dal < first ? first : a.dal;
+    const al = a.al > last ? last : a.al;
+    out.push(`  - ${a.nome} ${a.cognome}: ${dal === al ? dmy(dal) : `dal ${dmy(dal)} al ${dmy(al)}`}`);
+  }
+
+  head("FOGLI PRESENZE");
+  if (!fogli.length) out.push("Nessun foglio presenze per questo mese.");
+  for (const f of fogli) {
+    out.push(`${f.nome.toUpperCase()} — ${f.stato}`);
+    for (const r of f.righe) {
+      const rimb = [r.diaria && `diaria ${r.diaria}`, r.pernotti && `pernotti ${r.pernotti}`, r.viaggi && `viaggi ${r.viaggi}`].filter(Boolean).join(", ");
+      out.push(`  - ${dmy(r.data)} | ${r.tipologia || "-"} | ${r.location || "-"} | ruolo: ${r.ruolo || "-"} | tariffa: ${r.tariffa || "-"}${rimb ? ` | ${rimb}` : ""}`);
+    }
+    out.push("");
+  }
+
+  head("SHOUT DELL'ADMIN");
   if (!shouts.length) out.push("Nessuno shout in questo mese.");
   for (const sh of shouts) {
     const rec = (await db.prepare("SELECT nome, read_at FROM shout_recipients WHERE shout_id = ? ORDER BY nome").bind(sh.id).all<{ nome: string; read_at: string | null }>()).results;
@@ -1750,26 +1915,45 @@ async function buildMonthlyReport(db: D1Database, mese: string) {
     out.push(`  "${sh.testo}"`, "");
   }
 
-  head("5. MESSAGGI DELL'ADMIN IN TAVERNA");
-  if (!tav.length) out.push("Nessun messaggio dell'admin in Taverna in questo mese.");
-  for (const t of tav) {
+  head("MESSAGGI IN TAVERNA (chat comune)");
+  if (!chat.length) out.push("Nessun messaggio in Taverna in questo mese.");
+  for (const t of chat) {
     let tagged: string[] = [];
     try {
       tagged = t.mentions_json ? (JSON.parse(t.mentions_json) as Array<{ name: string }>).map((x) => x.name) : [];
     } catch {
       tagged = [];
     }
-    out.push(`${romeDateTime(t.created_at)} — a: tutti (chat comune)${tagged.length ? `, taggati: ${tagged.join(", ")}` : ""}`);
-    out.push(`  "${t.testo}"`, "");
+    out.push(`${romeDateTime(t.created_at)} — ${t.author_name}${t.author_role === "admin" ? " (admin)" : ""} a tutti${tagged.length ? `, taggati: ${tagged.join(", ")}` : ""}`);
+    out.push(`  "${t.testo}"`);
   }
+
+  head("STORICO ATTIVITÀ (user, password, eventi, inviti, risposte, assenze, fogli)");
+  if (!log.length) out.push("Nessuna attività registrata in questo mese.");
+  for (const l of log) out.push(`${romeDateTime(l.created_at)} — ${l.testo}`);
 
   out.push("", SEP, "FINE REPORT", SEP);
   return out.join("\n");
 }
 
+// Copia di sicurezza completa: tutte le tabelle (tranne gli accessi attivi), da ricaricare se serve
+const BACKUP_SKIP = new Set(["sessions", "_cf_KV", "sqlite_sequence", "d1_migrations"]);
+app.get("/api/admin/backup", async (c) => {
+  const tables = (await c.env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all<{ name: string }>()).results
+    .map((t) => t.name)
+    .filter((t) => !BACKUP_SKIP.has(t) && !t.startsWith("_cf_") && !t.startsWith("sqlite_"));
+  const data: Record<string, unknown[]> = {};
+  for (const t of tables) data[t] = (await c.env.DB.prepare(`SELECT * FROM "${t}"`).all()).results;
+  // le password leggibili non escono dall'app (restano quelle protette, che bastano per rimettere tutto)
+  data.users = (data.users ?? []).map((u) => ({ ...(u as Record<string, unknown>), password_visibile: null }));
+  return c.json({ success: true, app: "MalaStranApp", generato: new Date().toISOString(), schema: (await schemaStatus(c.env.DB)).version, tabelle: data });
+});
+
 async function cleanReports(db: D1Database) {
   await db.prepare(`DELETE FROM monthly_reports WHERE created_at < datetime('now', '-${REPORT_KEEP_DAYS} days')`).run();
   await db.prepare(`DELETE FROM taverna_admin_log WHERE created_at < datetime('now', '-400 days')`).run();
+  await db.prepare(`DELETE FROM chat_log WHERE created_at < datetime('now', '-400 days')`).run();
+  await db.prepare(`DELETE FROM attivita_log WHERE created_at < datetime('now', '-400 days')`).run();
 }
 
 app.post("/api/admin/report-mensile", async (c) => {
