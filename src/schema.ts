@@ -3,9 +3,10 @@
 // e aggiunge le colonne mancanti. Non cancella mai dati: eventuali tabelle di una
 // versione vecchia e incompatibile vengono solo rinominate in "legacy_*".
 
+import { seedDemoEvents } from "./seed-demo";
 import { SEED2_EVENT_CODE, SEED_EVENT_CODE, seedSecondoEvento, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -229,6 +230,7 @@ const EVENT_EXTRA_COLUMNS: Array<[string, string]> = [
   ["chiuso_at", "TEXT"],
   ["tematica", "TEXT"],
   ["sigla", "TEXT"],
+  ["demo", "INTEGER NOT NULL DEFAULT 0"],
 ];
 
 const LOAD_ROW_EXTRA_COLUMNS: Array<[string, string]> = [
@@ -326,6 +328,7 @@ async function migrate(db: D1Database): Promise<void> {
   // richiesta dell'admin: nell'evento di prova sono team leader tutti gli user chiamati
   if (previous > 0 && previous < 9) await seedSecondoEvento(db);
   // richiesta dell'admin: agli eventi di prova si dà solo una tematica (è quella che vedono gli user nel calendario)
+  if (previous > 0 && previous < 19) await seedDemoEvents(db);
   if (previous > 0 && previous < 18) {
     // i messaggi dell'admin già salvati passano nel nuovo registro della chat (che ora tiene anche quelli degli user)
     await db

@@ -1743,7 +1743,8 @@ async function archiveEvent(db: D1Database, eventId: number): Promise<boolean> {
 async function archiveOldEvents(db: D1Database): Promise<number> {
   await ensureSchema(db);
   const old = await db
-    .prepare("SELECT id FROM events WHERE data <= date('now', ?)")
+    // gli eventi DEMO non si archiviano mai da soli
+    .prepare("SELECT id FROM events WHERE data <= date('now', ?) AND COALESCE(demo, 0) = 0")
     .bind(`-${ARCHIVE_AFTER_DAYS} days`)
     .all<{ id: number }>();
   let n = 0;
