@@ -351,6 +351,8 @@ app.use("/api/*", async (c, next) => {
       t = `${who} ha risposto «${STATO_LABEL[String(b.stato)] ?? String(b.stato)}» per l'evento ${await eventName(db, decodeURIComponent(m[1]!))}${b.nota ? ` — nota: "${String(b.nota)}"` : ""}`;
     else if (method === "POST" && (m = /^\/api\/(admin|my)\/events\/([^/]+)\/chiudi$/.exec(path))) t = `${who} ha chiuso l'evento ${await eventName(db, decodeURIComponent(m[2]!))}`;
     else if (method === "POST" && (m = /^\/api\/admin\/events\/([^/]+)\/riapri$/.exec(path))) t = `Admin ha riaperto l'evento ${await eventName(db, decodeURIComponent(m[1]!))}`;
+    else if (method === "PATCH" && (m = /^\/api\/my\/events\/([^/]+)\/team\/(\d+)$/.exec(path)))
+      t = `${who} (team leader) ha scritto il ruolo di ${await userName(db, m[2])} per l'evento ${await eventName(db, decodeURIComponent(m[1]!))}: ${String(b.ruolo_evento || "-")}`;
     else if (method === "PUT" && (m = /^\/api\/my\/presenze\/([^/]+)$/.exec(path)))
       t = `${who} ha compilato il foglio presenza per l'evento ${await eventName(db, decodeURIComponent(m[1]!))}: ruolo ${String(b.ruolo || "-")}, tariffa ${String(b.tariffa || "-")}${b.diaria ? `, diaria ${String(b.diaria)}` : ""}${b.pernotti ? `, pernotti ${String(b.pernotti)}` : ""}${b.viaggi ? `, viaggi ${String(b.viaggi)}` : ""}`;
     else if (method === "POST" && (m = /^\/api\/my\/fogli\/(\d{4}-\d{2})\/chiudi$/.exec(path))) t = `${who} ha chiuso il suo foglio presenze di ${m[1]}`;
@@ -1165,6 +1167,22 @@ app.get("/api/my/events", async (c) => {
   });
 });
 
+// Il team leader può scrivere il ruolo (personaggio o compito tecnico) delle persone confermate del suo evento
+app.patch("/api/my/events/:code/team/:userId", async (c) => {
+  const row = await myParticipation(c, c.req.param("code"));
+  if (!row) return fail(c, 404, "Evento non trovato o non sei coinvolto");
+  if (row.is_tl !== 1 || row.mio_stato === "unavailable" || row.mio_stato === "rejected") return fail(c, 403, "Solo il team leader può scrivere i ruoli");
+  if (row.stato === "annullato") return fail(c, 409, "Evento annullato");
+  const userId = intParam(c, "userId");
+  const b = await body(c);
+  const r = await c.env.DB
+    .prepare("UPDATE event_participants SET ruolo_evento = ? WHERE event_id = ? AND user_id = ? AND stato = 'confirmed'")
+    .bind(str(b.ruolo_evento, 120), row.id, userId)
+    .run();
+  if (!r.meta.changes) return fail(c, 404, "Questa persona non è confermata in questo evento");
+  return c.json({ success: true });
+});
+
 // Calendario dello user: i suoi eventi + tutti gli eventi CONFERMATI dall'admin. Di quelli a cui non è stato chiamato vede solo giorno e tema.
 app.get("/api/my/calendario", async (c) => {
   const me = c.get("me");
@@ -1207,7 +1225,7 @@ app.get("/api/my/events/:code", async (c) => {
     stato === "confirmed"
       ? (
           await c.env.DB
-            .prepare("SELECT u.nome, u.cognome, p.ruolo_evento FROM event_participants p JOIN users u ON u.id = p.user_id WHERE p.event_id = ? AND p.stato = 'confirmed' ORDER BY u.cognome")
+            .prepare("SELECT p.user_id, u.nome, u.cognome, p.ruolo_evento, p.is_tl FROM event_participants p JOIN users u ON u.id = p.user_id WHERE p.event_id = ? AND p.stato = 'confirmed' ORDER BY u.cognome")
             .bind(row.id)
             .all()
         ).results
