@@ -8,6 +8,7 @@
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { ensureSchema, schemaStatus, siglaDaNome } from "./schema";
+import { seedDemoEvents } from "./seed-demo";
 
 type Bindings = { DB: D1Database; ADMIN_PASSWORD?: string };
 type SessionUser = { id: number | "admin"; nome: string; cognome: string; username: string; role: "admin" | "user" };
@@ -764,6 +765,7 @@ async function newEventCode(db: D1Database, date: string): Promise<string> {
 }
 
 app.get("/api/admin/events", async (c) => {
+  await seedDemoEvents(c.env.DB).catch((err) => console.error("eventi demo", err));
   const rows = await c.env.DB
     .prepare(
       `SELECT e.*,
