@@ -5,7 +5,7 @@
 
 import { SEED2_EVENT_CODE, SEED_EVENT_CODE, seedSecondoEvento, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -142,6 +142,18 @@ const TABLES: string[] = [
     PRIMARY KEY (shout_id, user_id)
   )`,
   `CREATE INDEX IF NOT EXISTS idx_shout_rec_user ON shout_recipients(user_id)`,
+  `CREATE TABLE IF NOT EXISTS taverna_admin_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    testo TEXT NOT NULL,
+    mentions_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS monthly_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mese TEXT NOT NULL,
+    testo TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
   `CREATE TABLE IF NOT EXISTS schema_info (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL,
@@ -184,6 +196,7 @@ const LOAD_ROW_EXTRA_COLUMNS: Array<[string, string]> = [
   ["note", "TEXT"],
   ["prep", "INTEGER NOT NULL DEFAULT 0"],
   ["annotazione", "TEXT"],
+  ["lost", "INTEGER NOT NULL DEFAULT 0"],
 ];
 
 const OLD_TABLES = ["availability_requests", "assignments", "tl_assignments"];

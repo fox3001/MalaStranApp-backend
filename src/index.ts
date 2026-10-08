@@ -207,6 +207,7 @@ function loadRowFromRow(row: Record<string, unknown>) {
     present: row.present === 1,
     returned: row.returned === 1,
     damaged: row.damaged === 1,
+    lost: row.lost === 1,
     prep: row.prep === 1,
     annotazione: (row.annotazione as string | null) ?? "",
     note: (row.note as string | null) ?? "",
@@ -669,7 +670,8 @@ app.get("/api/admin/events", async (c) => {
         (SELECT COUNT(*) FROM event_participants p WHERE p.event_id = e.id AND p.stato = 'available') AS disponibili,
         (SELECT COUNT(*) FROM event_participants p WHERE p.event_id = e.id AND p.stato = 'confirmed') AS confermati,
         (SELECT COUNT(*) FROM load_rows l WHERE l.event_id = e.id) AS righe_bolla,
-        (SELECT COUNT(*) FROM load_rows l WHERE l.event_id = e.id AND l.damaged = 1) AS danni
+        (SELECT COUNT(*) FROM load_rows l WHERE l.event_id = e.id AND l.damaged = 1) AS danni,
+        (SELECT COUNT(*) FROM load_rows l WHERE l.event_id = e.id AND l.lost = 1) AS persi
        FROM events e ORDER BY e.data, e.ora_inizio`,
     )
     .all();
@@ -677,7 +679,7 @@ app.get("/api/admin/events", async (c) => {
     success: true,
     events: rows.results.map((r) => ({
       ...eventFromRow(r),
-      conteggi: { invitati: r.invitati, in_attesa: r.in_attesa, disponibili: r.disponibili, confermati: r.confermati, righe_bolla: r.righe_bolla, danni: r.danni },
+      conteggi: { invitati: r.invitati, in_attesa: r.in_attesa, disponibili: r.disponibili, confermati: r.confermati, righe_bolla: r.righe_bolla, danni: r.danni, persi: r.persi },
     })),
   });
 });
@@ -937,7 +939,7 @@ app.patch("/api/admin/load-rows/:rid", async (c) => {
     sets.push("quantita = ?");
     vals.push(Number.isInteger(q) && q > 0 ? q : 1);
   }
-  for (const f of ["prep", "present", "returned", "damaged"] as const) {
+  for (const f of ["prep", "present", "returned", "damaged", "lost"] as const) {
     if (b[f] === undefined) continue;
     sets.push(`${f} = ?`);
     vals.push(bool(b[f]));
@@ -1010,7 +1012,7 @@ app.get("/api/admin/report", async (c) => {
     where.push("e.code = ?");
     vals.push(code);
   }
-  if (onlyIssues) where.push("(l.damaged = 1 OR (l.comment IS NOT NULL AND l.comment != '') OR (l.present = 1 AND l.returned = 0))");
+  if (onlyIssues) where.push("(l.damaged = 1 OR l.lost = 1 OR (l.comment IS NOT NULL AND l.comment != '') OR (l.present = 1 AND l.returned = 0))");
   const rows = await c.env.DB
     .prepare(
       `SELECT l.*, e.code AS event_code, e.nome AS event_nome, e.data AS event_data, u.nome AS assigned_nome, u.cognome AS assigned_cognome
@@ -1143,7 +1145,7 @@ app.patch("/api/my/load-rows/:rid", async (c) => {
   const b = await body(c);
   const sets: string[] = [];
   const vals: unknown[] = [];
-  for (const f of ["present", "returned", "damaged"] as const) {
+  for (const f of ["present", "returned", "damaged", "lost"] as const) {
     if (b[f] === undefined) continue;
     sets.push(`${f} = ?`);
     vals.push(bool(b[f]));
@@ -1158,6 +1160,9 @@ app.patch("/api/my/load-rows/:rid", async (c) => {
   await c.env.DB.prepare(`UPDATE load_rows SET ${sets.join(", ")} WHERE id = ?`).bind(...vals, rid).run();
   if (b.damaged !== undefined && bool(b.damaged) && row.damaged !== 1) {
     await notifyAdmin(c.env.DB, "danno", `${me.nome} ${me.cognome} ha segnalato un danno: ${row.item as string} (${row.event_nome as string})`, row.event_id as number);
+  }
+  if (b.lost !== undefined && bool(b.lost) && row.lost !== 1) {
+    await notifyAdmin(c.env.DB, "perso", `${me.nome} ${me.cognome} ha segnalato un oggetto perso: ${row.item as string} (${row.event_nome as string})`, row.event_id as number);
   }
   const updated = await c.env.DB.prepare("SELECT * FROM load_rows WHERE id = ?").bind(rid).first();
   return c.json({ success: true, row: loadRowFromRow(updated!) });
@@ -1242,6 +1247,10 @@ app.post("/api/taverna", async (c) => {
     .prepare("INSERT INTO chat_messages (author_role, user_id, author_name, testo, mentions_json) VALUES (?, ?, ?, ?, ?)")
     .bind(me.role, me.role === "user" ? me.id : null, name, testo, mentions.length ? JSON.stringify(mentions) : null)
     .run();
+  // i messaggi dell'admin restano salvati per il report del mese (la chat invece si svuota dopo 24 ore)
+  if (me.role === "admin") {
+    await c.env.DB.prepare("INSERT INTO taverna_admin_log (testo, mentions_json) VALUES (?, ?)").bind(testo, mentions.length ? JSON.stringify(mentions) : null).run();
+  }
   // chi è stato taggato riceve una notifica
   if (mentions.length) {
     const snippet = testo.length > 80 ? testo.slice(0, 80) + "…" : testo;
@@ -1412,11 +1421,12 @@ async function buildResoconto(db: D1Database, eventId: number) {
       presenti: rows.filter((r) => r.present).length,
       rientrati: rows.filter((r) => r.returned).length,
       danneggiati: rows.filter((r) => r.damaged).length,
+      persi: rows.filter((r) => r.lost).length,
       mai_segnati_presenti: rows.filter((r) => !r.present).length,
       non_rientrati: rows.filter((r) => r.present && !r.returned).length,
     },
   };
-  const problemi = rows.filter((r) => r.damaged || r.comment || r.annotazione || (r.present && !r.returned));
+  const problemi = rows.filter((r) => r.damaged || r.lost || r.comment || r.annotazione || (r.present && !r.returned));
 
   const L: string[] = [];
   const line = (s = "") => L.push(s);
@@ -1442,9 +1452,9 @@ async function buildResoconto(db: D1Database, eventId: number) {
   }
   line();
   const sb = summary.bolla;
-  line(`BOLLA DI CARICO — voci ${sb.oggetti}, entrate ${sb.presenti}, uscite ${sb.rientrati}, danneggiate ${sb.danneggiati}, entrate ma non uscite ${sb.non_rientrati}`);
+  line(`BOLLA DI CARICO — voci ${sb.oggetti}, entrate ${sb.presenti}, uscite ${sb.rientrati}, danneggiate ${sb.danneggiati}, perse ${sb.persi}, entrate ma non uscite ${sb.non_rientrati}`);
   for (const r of rows) {
-    const flags = [r.prep ? "prep" : "NO prep", r.present ? "entrata" : "NO entrata", r.returned ? "uscita" : "NO uscita", r.damaged ? "DANNEGGIATO" : ""].filter(Boolean).join(", ");
+    const flags = [r.prep ? "prep" : "NO prep", r.present ? "entrata" : "NO entrata", r.returned ? "uscita" : "NO uscita", r.damaged ? "DANNEGGIATO" : "", r.lost ? "PERSO" : ""].filter(Boolean).join(", ");
     line(`  - [${r.categoria || "-"}] ${r.quantita > 1 ? `${r.quantita}x ` : ""}${r.item}${r.codice ? ` (${r.codice})` : ""}${r.taglia ? ` tg ${r.taglia}` : ""}${r.note ? ` {${r.note}}` : ""}: ${flags}${r.comment ? ` — "${r.comment}"` : ""}${r.annotazione ? ` — ANNOTAZIONE ADMIN: ${r.annotazione}` : ""}`);
   }
   line();
@@ -1503,47 +1513,136 @@ app.get("/api/admin/archive/all", async (c) => {
   return c.json({ success: true, testo: head + rows.results.map((r) => r.testo).join("\n") });
 });
 
-// Report mensile in testo: eventi del mese (resoconti) + shout mandati nel mese
-app.get("/api/admin/report-mensile", async (c) => {
-  const mese = c.req.query("mese") ?? "";
-  if (!/^\d{4}-\d{2}$/.test(mese)) return fail(c, 400, "Mese non valido");
+// ---------------------------------------------------------------------------
+// Report del mese: un unico .txt ordinato con tutto quello che è successo.
+// I report fatti restano in archivio 3 mesi, poi si cancellano da soli.
+// ---------------------------------------------------------------------------
+
+const REPORT_KEEP_DAYS = 90;
+const MESI = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+const romeMonth = (sql: string) => new Date(sql.replace(" ", "T") + "Z").toLocaleDateString("en-CA", { timeZone: "Europe/Rome" }).slice(0, 7);
+
+async function buildMonthlyReport(db: D1Database, mese: string) {
   const [y, m] = mese.split("-").map(Number) as [number, number];
-  const MESI = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
-  const sep = "=".repeat(60);
-  const parts: string[] = [`REPORT MENSILE MALASTRANA — ${MESI[m - 1]} ${y}`, `generato il ${romeDateTime(new Date().toISOString().slice(0, 19).replace("T", " "))}`, ""];
+  const SEP = "=".repeat(64);
+  const sub = "-".repeat(64);
+  const out: string[] = [];
+  const head = (t: string) => out.push("", SEP, t, SEP, "");
 
-  // eventi: quelli archiviati hanno il resoconto salvato, gli altri si preparano ora
-  const archived = await c.env.DB.prepare("SELECT code, testo FROM event_archives WHERE substr(data, 1, 7) = ? ORDER BY data, id").bind(mese).all<{ code: string; testo: string }>();
-  const live = await c.env.DB.prepare("SELECT id, code FROM events WHERE substr(data, 1, 7) = ? ORDER BY data, id").bind(mese).all<{ id: number; code: string }>();
-  const done = new Set(archived.results.map((a) => a.code));
-  const texts = archived.results.map((a) => a.testo);
+  // eventi del mese: quelli ancora nell'app si leggono per intero, quelli già archiviati dal loro resoconto salvato
+  const live = await db.prepare("SELECT id, code FROM events WHERE substr(data, 1, 7) = ? ORDER BY data, id").bind(mese).all<{ id: number; code: string }>();
+  const archived = await db.prepare("SELECT code, nome, data, testo FROM event_archives WHERE substr(data, 1, 7) = ? ORDER BY data, id").bind(mese).all<{ code: string; nome: string; data: string; testo: string }>();
+  const reso = [];
   for (const e of live.results) {
-    if (done.has(e.code)) continue;
-    const r = await buildResoconto(c.env.DB, e.id);
-    if (r) texts.push(r.testo);
+    const r = await buildResoconto(db, e.id);
+    if (r) reso.push(r);
   }
-  parts.push(sep, `EVENTI DEL MESE (${texts.length})`, sep, "");
-  parts.push(texts.length ? texts.join("\n\n" + "-".repeat(60) + "\n\n") : "Nessun evento in questo mese.", "");
+  const liveCodes = new Set(reso.map((r) => r.event.code));
+  const oldOnes = archived.results.filter((a) => !liveCodes.has(a.code));
 
-  // shout, con data e ora italiane
-  const shouts = await c.env.DB.prepare("SELECT id, testo, a_tutti, created_at FROM shouts ORDER BY id").all<{ id: number; testo: string; a_tutti: number; created_at: string }>();
-  const ofMonth = shouts.results.filter((s) => {
-    const d = new Date(s.created_at.replace(" ", "T") + "Z").toLocaleDateString("en-CA", { timeZone: "Europe/Rome" });
-    return d.slice(0, 7) === mese;
+  const people = new Map<string, number>();
+  for (const r of reso) for (const p of r.people) if (p.stato === "confirmed") people.set(`${p.nome} ${p.cognome}`, (people.get(`${p.nome} ${p.cognome}`) ?? 0) + 1);
+  const issues = reso.flatMap((r) => r.problemi.filter((x) => x.damaged || x.lost).map((x) => ({ ev: r.event, row: x })));
+
+  const shouts = (await db.prepare("SELECT id, testo, a_tutti, created_at FROM shouts ORDER BY id").all<{ id: number; testo: string; a_tutti: number; created_at: string }>()).results.filter(
+    (s) => romeMonth(s.created_at) === mese,
+  );
+  const tav = (await db.prepare("SELECT testo, mentions_json, created_at FROM taverna_admin_log ORDER BY id").all<{ testo: string; mentions_json: string | null; created_at: string }>()).results.filter(
+    (t) => romeMonth(t.created_at) === mese,
+  );
+
+  out.push(`REPORT DEL MESE — MALASTRANA EVENTI — ${MESI[m - 1]!.toUpperCase()} ${y}`);
+  out.push(`Generato il ${romeDateTime(new Date().toISOString().slice(0, 19).replace("T", " "))}`);
+
+  head("RIEPILOGO");
+  out.push(`Eventi del mese: ${reso.length + oldOnes.length}`);
+  out.push(`Persone che hanno lavorato (confermate): ${people.size}`);
+  out.push(`Oggetti danneggiati: ${issues.filter((i) => i.row.damaged).length}`);
+  out.push(`Oggetti persi: ${issues.filter((i) => i.row.lost).length}`);
+  out.push(`Shout mandati: ${shouts.length}`);
+  out.push(`Messaggi dell'admin in Taverna: ${tav.length}`);
+
+  head("1. EVENTI DEL MESE");
+  if (!reso.length && !oldOnes.length) out.push("Nessun evento in questo mese.");
+  reso.forEach((r, i) => {
+    if (i) out.push(sub, "");
+    out.push(r.testo);
   });
-  parts.push(sep, `SHOUT DEL MESE (${ofMonth.length})`, sep, "");
-  if (!ofMonth.length) parts.push("Nessuno shout in questo mese.");
-  for (const s of ofMonth) {
-    const rec = await c.env.DB.prepare("SELECT nome, read_at FROM shout_recipients WHERE shout_id = ? ORDER BY nome").bind(s.id).all<{ nome: string; read_at: string | null }>();
-    const names = rec.results.map((r) => r.nome).join(", ");
-    parts.push(
-      `${romeDateTime(s.created_at)} — a: ${s.a_tutti ? `TUTTI (${rec.results.length} user: ${names})` : names}`,
-      `Letto da ${rec.results.filter((r) => r.read_at).length} su ${rec.results.length}`,
-      s.testo,
-      "",
-    );
+  oldOnes.forEach((a, i) => {
+    if (i || reso.length) out.push(sub, "");
+    out.push(a.testo);
+  });
+
+  head("2. CHI HA LAVORATO NEL MESE");
+  if (!people.size) out.push("Nessuno confermato in questo mese.");
+  for (const [n, k] of [...people.entries()].sort((a, b) => a[0].localeCompare(b[0]))) out.push(`  - ${n}: ${k} ${k === 1 ? "evento" : "eventi"}`);
+
+  head("3. DANNI E PERDITE");
+  if (!issues.length) out.push("Nessun oggetto danneggiato o perso." + (oldOnes.length ? " (Per gli eventi già archiviati vedi il loro resoconto sopra.)" : ""));
+  for (const { ev, row } of issues) {
+    const what = [row.damaged ? "DANNEGGIATO" : "", row.lost ? "PERSO" : ""].filter(Boolean).join(" + ");
+    out.push(`  - ${ev.data} ${ev.nome}: ${row.quantita > 1 ? `${row.quantita}x ` : ""}${row.item}${row.codice ? ` (${row.codice})` : ""} — ${what}${row.assigned_name ? ` — affidato a ${row.assigned_name}` : ""}`);
+    if (row.comment) out.push(`      cosa è successo: "${row.comment}"${row.updated_by ? ` (segnato da ${row.updated_by})` : ""}`);
+    if (row.annotazione) out.push(`      annotazione admin: ${row.annotazione}`);
   }
-  return c.json({ success: true, testo: parts.join("\n") });
+
+  head("4. SHOUT DELL'ADMIN");
+  if (!shouts.length) out.push("Nessuno shout in questo mese.");
+  for (const sh of shouts) {
+    const rec = (await db.prepare("SELECT nome, read_at FROM shout_recipients WHERE shout_id = ? ORDER BY nome").bind(sh.id).all<{ nome: string; read_at: string | null }>()).results;
+    out.push(`${romeDateTime(sh.created_at)} — a: ${sh.a_tutti ? `TUTTI (${rec.length} user)` : rec.map((r) => r.nome).join(", ")}`);
+    if (sh.a_tutti) out.push(`  destinatari: ${rec.map((r) => r.nome).join(", ")}`);
+    out.push(`  letto da ${rec.filter((r) => r.read_at).length} su ${rec.length}`);
+    out.push(`  "${sh.testo}"`, "");
+  }
+
+  head("5. MESSAGGI DELL'ADMIN IN TAVERNA");
+  if (!tav.length) out.push("Nessun messaggio dell'admin in Taverna in questo mese.");
+  for (const t of tav) {
+    let tagged: string[] = [];
+    try {
+      tagged = t.mentions_json ? (JSON.parse(t.mentions_json) as Array<{ name: string }>).map((x) => x.name) : [];
+    } catch {
+      tagged = [];
+    }
+    out.push(`${romeDateTime(t.created_at)} — a: tutti (chat comune)${tagged.length ? `, taggati: ${tagged.join(", ")}` : ""}`);
+    out.push(`  "${t.testo}"`, "");
+  }
+
+  out.push("", SEP, "FINE REPORT", SEP);
+  return out.join("\n");
+}
+
+async function cleanReports(db: D1Database) {
+  await db.prepare(`DELETE FROM monthly_reports WHERE created_at < datetime('now', '-${REPORT_KEEP_DAYS} days')`).run();
+  await db.prepare(`DELETE FROM taverna_admin_log WHERE created_at < datetime('now', '-400 days')`).run();
+}
+
+app.post("/api/admin/report-mensile", async (c) => {
+  const b = await body(c);
+  const mese = typeof b.mese === "string" ? b.mese : "";
+  if (!/^\d{4}-\d{2}$/.test(mese)) return fail(c, 400, "Mese non valido");
+  const testo = await buildMonthlyReport(c.env.DB, mese);
+  // un solo report per mese: quello nuovo sostituisce il vecchio
+  await c.env.DB.prepare("DELETE FROM monthly_reports WHERE mese = ?").bind(mese).run();
+  const r = await c.env.DB.prepare("INSERT INTO monthly_reports (mese, testo) VALUES (?, ?)").bind(mese, testo).run();
+  return c.json({ success: true, id: r.meta.last_row_id, testo }, 201);
+});
+
+app.get("/api/admin/report-mensili", async (c) => {
+  await cleanReports(c.env.DB);
+  const rows = await c.env.DB
+    .prepare(`SELECT id, mese, created_at, date(created_at, '+${REPORT_KEEP_DAYS} days') AS scade_il FROM monthly_reports ORDER BY mese DESC`)
+    .all<{ id: number; mese: string; created_at: string; scade_il: string }>();
+  return c.json({ success: true, reports: rows.results.map((r) => ({ ...r, quando: romeDateTime(r.created_at) })) });
+});
+
+app.get("/api/admin/report-mensili/:id", async (c) => {
+  const id = intParam(c, "id");
+  if (!id) return fail(c, 400, "ID non valido");
+  const row = await c.env.DB.prepare("SELECT mese, testo FROM monthly_reports WHERE id = ?").bind(id).first<{ mese: string; testo: string }>();
+  if (!row) return fail(c, 404, "Report non trovato (forse è già scaduto)");
+  return c.json({ success: true, ...row });
 });
 
 app.get("/api/admin/archive/:id", async (c) => {
@@ -1567,5 +1666,6 @@ export default {
     );
     // pulizia notturna della Taverna (i messaggi durano 24 ore)
     ctx.waitUntil(cleanTaverna(env.DB).catch(() => undefined));
+    ctx.waitUntil(cleanReports(env.DB).catch(() => undefined));
   },
 };
