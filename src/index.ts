@@ -1165,14 +1165,14 @@ app.get("/api/my/events", async (c) => {
   });
 });
 
-// Calendario dello user: TUTTI gli eventi. Di quelli a cui non è stato chiamato vede solo giorno e tema.
+// Calendario dello user: i suoi eventi + tutti gli eventi CONFERMATI dall'admin. Di quelli a cui non è stato chiamato vede solo giorno e tema.
 app.get("/api/my/calendario", async (c) => {
   const me = c.get("me");
   const rows = await c.env.DB
     .prepare(
       `SELECT e.code, e.data, e.tematica, e.tipo, e.stato, p.stato AS mio_stato FROM events e
        LEFT JOIN event_participants p ON p.event_id = e.id AND p.user_id = ?
-       WHERE e.stato != 'annullato' ORDER BY e.data`,
+       WHERE e.stato != 'annullato' AND (p.stato IS NOT NULL OR e.stato IN ('confermato', 'chiuso')) ORDER BY e.data`,
     )
     .bind(me.id)
     .all<{ code: string; data: string; tematica: string | null; tipo: string | null; stato: string; mio_stato: string | null }>();
