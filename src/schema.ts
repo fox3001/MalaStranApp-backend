@@ -5,7 +5,7 @@
 
 import { SEED2_EVENT_CODE, SEED_EVENT_CODE, seedSecondoEvento, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -128,6 +128,20 @@ const TABLES: string[] = [
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
   `CREATE INDEX IF NOT EXISTS idx_user_assenze_user ON user_assenze(user_id, al)`,
+  `CREATE TABLE IF NOT EXISTS shouts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    testo TEXT NOT NULL,
+    a_tutti INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+  `CREATE TABLE IF NOT EXISTS shout_recipients (
+    shout_id INTEGER NOT NULL REFERENCES shouts(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL,
+    nome TEXT NOT NULL,
+    read_at TEXT,
+    PRIMARY KEY (shout_id, user_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_shout_rec_user ON shout_recipients(user_id)`,
   `CREATE TABLE IF NOT EXISTS schema_info (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL,

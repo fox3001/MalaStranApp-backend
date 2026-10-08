@@ -277,6 +277,8 @@ async function requireUser(c: C, next: () => Promise<void>) {
 }
 app.use("/api/my/*", requireUser);
 app.use("/api/profile", requireUser);
+app.use("/api/shouts", requireUser);
+app.use("/api/shouts/*", requireUser);
 app.use("/api/profile/*", requireUser);
 
 // Le notifiche servono a entrambi.
@@ -1291,6 +1293,76 @@ app.post("/api/notifications/:nid/read", async (c) => {
 });
 
 // ---------------------------------------------------------------------------
+// Shout: messaggi scritti dall'admin a uno, più o tutti gli user. Restano salvati.
+// ---------------------------------------------------------------------------
+
+const SHOUT_MAX = 1000;
+/** "08/10/2026 10:59" in ora italiana, da una data del database (UTC) */
+function romeDateTime(sql: string) {
+  const d = new Date(sql.replace(" ", "T") + "Z");
+  return d.toLocaleString("it-IT", { timeZone: "Europe/Rome", day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }).replace(",", "");
+}
+
+app.post("/api/admin/shouts", async (c) => {
+  const b = await body(c);
+  const testo = typeof b.testo === "string" ? b.testo.trim() : "";
+  if (!testo) return fail(c, 400, "Il messaggio è vuoto");
+  if (testo.length > SHOUT_MAX) return fail(c, 400, `Massimo ${SHOUT_MAX} caratteri`);
+  const tutti = b.tutti === true;
+  const ids = Array.isArray(b.user_ids) ? b.user_ids.filter((x): x is number => Number.isInteger(x)) : [];
+  const rows = tutti
+    ? await c.env.DB.prepare("SELECT id, nome, cognome, username FROM users WHERE ruolo = 'user' AND attivo = 1").all<{ id: number; nome: string; cognome: string; username: string }>()
+    : ids.length
+      ? await c.env.DB.prepare(`SELECT id, nome, cognome, username FROM users WHERE ruolo = 'user' AND id IN (${ids.map(() => "?").join(",")})`).bind(...ids).all<{ id: number; nome: string; cognome: string; username: string }>()
+      : { results: [] as Array<{ id: number; nome: string; cognome: string; username: string }> };
+  if (!rows.results.length) return fail(c, 400, "Scegli almeno uno user");
+  const r = await c.env.DB.prepare("INSERT INTO shouts (testo, a_tutti) VALUES (?, ?)").bind(testo, tutti ? 1 : 0).run();
+  const sid = r.meta.last_row_id;
+  const snippet = testo.length > 80 ? testo.slice(0, 80) + "…" : testo;
+  const stmts = rows.results.flatMap((u) => [
+    c.env.DB.prepare("INSERT INTO shout_recipients (shout_id, user_id, nome) VALUES (?, ?, ?)").bind(sid, u.id, `${u.nome} ${u.cognome}`.trim() || u.username),
+    c.env.DB.prepare("INSERT INTO notifications (user_id, for_admin, type, message, event_id) VALUES (?, 0, 'shout', ?, NULL)").bind(u.id, `Shout dall'admin: «${snippet}»`),
+  ]);
+  for (let i = 0; i < stmts.length; i += 90) await c.env.DB.batch(stmts.slice(i, i + 90));
+  return c.json({ success: true, id: sid, recipients: rows.results.length }, 201);
+});
+
+app.get("/api/admin/shouts", async (c) => {
+  const shouts = await c.env.DB.prepare("SELECT id, testo, a_tutti, created_at FROM shouts ORDER BY id DESC LIMIT 200").all<{ id: number; testo: string; a_tutti: number; created_at: string }>();
+  const rec = await c.env.DB.prepare("SELECT shout_id, user_id, nome, read_at FROM shout_recipients WHERE shout_id >= ?").bind(shouts.results.at(-1)?.id ?? 0).all<{ shout_id: number; user_id: number; nome: string; read_at: string | null }>();
+  return c.json({
+    success: true,
+    shouts: shouts.results.map((s) => {
+      const r = rec.results.filter((x) => x.shout_id === s.id);
+      return { ...s, a_tutti: s.a_tutti === 1, destinatari: r.map((x) => x.nome), letti: r.filter((x) => x.read_at).length, quando: romeDateTime(s.created_at) };
+    }),
+  });
+});
+
+app.get("/api/shouts", async (c) => {
+  const me = c.get("me");
+  const rows = await c.env.DB
+    .prepare(
+      `SELECT s.id, s.testo, s.a_tutti, s.created_at, r.read_at FROM shout_recipients r JOIN shouts s ON s.id = r.shout_id
+       WHERE r.user_id = ? ORDER BY s.id DESC LIMIT 100`,
+    )
+    .bind(me.id)
+    .all<{ id: number; testo: string; a_tutti: number; created_at: string; read_at: string | null }>();
+  return c.json({
+    success: true,
+    unread: rows.results.filter((r) => !r.read_at).length,
+    shouts: rows.results.map((r) => ({ id: r.id, testo: r.testo, a_tutti: r.a_tutti === 1, created_at: r.created_at, quando: romeDateTime(r.created_at), letto: !!r.read_at })),
+  });
+});
+
+app.post("/api/shouts/read", async (c) => {
+  const me = c.get("me");
+  await c.env.DB.prepare("UPDATE shout_recipients SET read_at = datetime('now') WHERE user_id = ? AND read_at IS NULL").bind(me.id).run();
+  await c.env.DB.prepare("UPDATE notifications SET is_read = 1 WHERE user_id = ? AND type = 'shout' AND is_read = 0").bind(me.id).run();
+  return c.json({ success: true });
+});
+
+// ---------------------------------------------------------------------------
 // Resoconto evento e archivio
 // ---------------------------------------------------------------------------
 
@@ -1429,6 +1501,49 @@ app.get("/api/admin/archive/all", async (c) => {
   const rows = await c.env.DB.prepare("SELECT testo FROM event_archives ORDER BY data, id").all<{ testo: string }>();
   const head = `ARCHIVIO EVENTI MALASTRANA — generato il ${new Date().toISOString().slice(0, 10)} — ${rows.results.length} eventi\n\n`;
   return c.json({ success: true, testo: head + rows.results.map((r) => r.testo).join("\n") });
+});
+
+// Report mensile in testo: eventi del mese (resoconti) + shout mandati nel mese
+app.get("/api/admin/report-mensile", async (c) => {
+  const mese = c.req.query("mese") ?? "";
+  if (!/^\d{4}-\d{2}$/.test(mese)) return fail(c, 400, "Mese non valido");
+  const [y, m] = mese.split("-").map(Number) as [number, number];
+  const MESI = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+  const sep = "=".repeat(60);
+  const parts: string[] = [`REPORT MENSILE MALASTRANA — ${MESI[m - 1]} ${y}`, `generato il ${romeDateTime(new Date().toISOString().slice(0, 19).replace("T", " "))}`, ""];
+
+  // eventi: quelli archiviati hanno il resoconto salvato, gli altri si preparano ora
+  const archived = await c.env.DB.prepare("SELECT code, testo FROM event_archives WHERE substr(data, 1, 7) = ? ORDER BY data, id").bind(mese).all<{ code: string; testo: string }>();
+  const live = await c.env.DB.prepare("SELECT id, code FROM events WHERE substr(data, 1, 7) = ? ORDER BY data, id").bind(mese).all<{ id: number; code: string }>();
+  const done = new Set(archived.results.map((a) => a.code));
+  const texts = archived.results.map((a) => a.testo);
+  for (const e of live.results) {
+    if (done.has(e.code)) continue;
+    const r = await buildResoconto(c.env.DB, e.id);
+    if (r) texts.push(r.testo);
+  }
+  parts.push(sep, `EVENTI DEL MESE (${texts.length})`, sep, "");
+  parts.push(texts.length ? texts.join("\n\n" + "-".repeat(60) + "\n\n") : "Nessun evento in questo mese.", "");
+
+  // shout, con data e ora italiane
+  const shouts = await c.env.DB.prepare("SELECT id, testo, a_tutti, created_at FROM shouts ORDER BY id").all<{ id: number; testo: string; a_tutti: number; created_at: string }>();
+  const ofMonth = shouts.results.filter((s) => {
+    const d = new Date(s.created_at.replace(" ", "T") + "Z").toLocaleDateString("en-CA", { timeZone: "Europe/Rome" });
+    return d.slice(0, 7) === mese;
+  });
+  parts.push(sep, `SHOUT DEL MESE (${ofMonth.length})`, sep, "");
+  if (!ofMonth.length) parts.push("Nessuno shout in questo mese.");
+  for (const s of ofMonth) {
+    const rec = await c.env.DB.prepare("SELECT nome, read_at FROM shout_recipients WHERE shout_id = ? ORDER BY nome").bind(s.id).all<{ nome: string; read_at: string | null }>();
+    const names = rec.results.map((r) => r.nome).join(", ");
+    parts.push(
+      `${romeDateTime(s.created_at)} — a: ${s.a_tutti ? `TUTTI (${rec.results.length} user: ${names})` : names}`,
+      `Letto da ${rec.results.filter((r) => r.read_at).length} su ${rec.results.length}`,
+      s.testo,
+      "",
+    );
+  }
+  return c.json({ success: true, testo: parts.join("\n") });
 });
 
 app.get("/api/admin/archive/:id", async (c) => {
