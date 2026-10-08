@@ -5,7 +5,7 @@
 
 import { SEED2_EVENT_CODE, SEED_EVENT_CODE, seedSecondoEvento, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -148,6 +148,33 @@ const TABLES: string[] = [
     mentions_json TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
+  `CREATE TABLE IF NOT EXISTS presenze (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    event_id INTEGER NOT NULL,
+    mese TEXT NOT NULL,
+    data TEXT NOT NULL,
+    tipologia TEXT,
+    location TEXT,
+    ruolo TEXT,
+    tariffa TEXT,
+    diaria TEXT,
+    pernotti TEXT,
+    viaggi TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (user_id, event_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_presenze_user_mese ON presenze(user_id, mese)`,
+  `CREATE TABLE IF NOT EXISTS fogli_presenza (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    mese TEXT NOT NULL,
+    nome TEXT NOT NULL,
+    cognome TEXT NOT NULL,
+    righe_json TEXT NOT NULL,
+    closed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (user_id, mese)
+  )`,
   `CREATE TABLE IF NOT EXISTS monthly_reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     mese TEXT NOT NULL,
@@ -188,6 +215,7 @@ const EVENT_EXTRA_COLUMNS: Array<[string, string]> = [
   ["chiuso_da", "TEXT"],
   ["chiuso_at", "TEXT"],
   ["tematica", "TEXT"],
+  ["sigla", "TEXT"],
 ];
 
 const LOAD_ROW_EXTRA_COLUMNS: Array<[string, string]> = [
@@ -285,6 +313,14 @@ async function migrate(db: D1Database): Promise<void> {
   // richiesta dell'admin: nell'evento di prova sono team leader tutti gli user chiamati
   if (previous > 0 && previous < 9) await seedSecondoEvento(db);
   // richiesta dell'admin: agli eventi di prova si dà solo una tematica (è quella che vedono gli user nel calendario)
+  if (previous > 0 && previous < 17) {
+    // la sigla (es. "OaC6") si ricava dal nome degli eventi già esistenti
+    const evs = await db.prepare("SELECT id, nome FROM events WHERE sigla IS NULL OR sigla = ''").all<{ id: number; nome: string }>();
+    for (const e of evs.results) {
+      const s = siglaDaNome(e.nome);
+      if (s) await db.prepare("UPDATE events SET sigla = ? WHERE id = ?").bind(s, e.id).run();
+    }
+  }
   if (previous > 0 && previous < 10) {
     await db.batch([
       db.prepare("UPDATE events SET tematica = 'Medievale' WHERE code = ? AND (tematica IS NULL OR tematica = '')").bind(SEED_EVENT_CODE),
@@ -302,4 +338,14 @@ export async function schemaStatus(db: D1Database) {
     ? await db.prepare("SELECT version FROM schema_info WHERE id = 1").first<{ version: number }>()
     : null;
   return { version: row?.version ?? 0, tables };
+}
+
+/** Cerca nel nome dell'evento una sigla tipo "OaC6" (maiuscole e minuscole mescolate, eventuale numero). */
+export function siglaDaNome(nome: string): string {
+  for (const t of nome.split(/[\s–—\-_,.()]+/)) {
+    if (t.length > 8 || !/^[A-Z][A-Za-z]*\d*$/.test(t)) continue;
+    const upper = (t.match(/[A-Z]/g) ?? []).length;
+    if (upper >= 2 && /[a-z]/.test(t)) return t;
+  }
+  return "";
 }

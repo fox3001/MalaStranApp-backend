@@ -7,7 +7,7 @@
 
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
-import { ensureSchema, schemaStatus } from "./schema";
+import { ensureSchema, schemaStatus, siglaDaNome } from "./schema";
 
 type Bindings = { DB: D1Database; ADMIN_PASSWORD?: string };
 type SessionUser = { id: number | "admin"; nome: string; cognome: string; username: string; role: "admin" | "user" };
@@ -176,6 +176,7 @@ function eventFromRow(row: Record<string, unknown>) {
     luogo: (row.luogo as string | null) ?? "",
     tipo: (row.tipo as string | null) ?? "",
     tematica: (row.tematica as string | null) ?? "",
+    sigla: (row.sigla as string | null) ?? "",
     descrizione: (row.descrizione as string | null) ?? "",
     info_operative: (row.info_operative as string | null) ?? "",
     referente_nome: (row.referente_nome as string | null) ?? "",
@@ -645,7 +646,7 @@ app.delete("/api/admin/users/:id/costumes/:cid", async (c) => {
 
 const EVENT_FIELDS = [
   "nome", "data", "ora_ritrovo", "ora_inizio", "ora_fine", "luogo", "tipo", "tematica", "descrizione", "info_operative",
-  "referente_nome", "referente_telefono", "compenso", "note_admin", "motivo_annullamento", "note_finali",
+  "referente_nome", "referente_telefono", "compenso", "note_admin", "motivo_annullamento", "note_finali", "sigla",
 ] as const;
 
 async function eventByCode(db: D1Database, code: string) {
@@ -692,7 +693,7 @@ app.post("/api/admin/events", async (c) => {
   if (!data || !/^\d{4}-\d{2}-\d{2}$/.test(data)) return fail(c, 400, "La data dell'evento è obbligatoria (formato AAAA-MM-GG)");
   const stato = typeof b.stato === "string" && EVENT_STATES.includes(b.stato) ? b.stato : "richiesta";
   const code = await newEventCode(c.env.DB, data);
-  const values = EVENT_FIELDS.map((f) => (f === "nome" ? nome : f === "data" ? data : str(b[f])));
+  const values = EVENT_FIELDS.map((f) => (f === "nome" ? nome : f === "data" ? data : f === "sigla" ? str(b.sigla, 12) || siglaDaNome(nome) || null : str(b[f])));
   await c.env.DB
     .prepare(`INSERT INTO events (code, ${EVENT_FIELDS.join(", ")}, compenso_visibile, stato) VALUES (?, ${EVENT_FIELDS.map(() => "?").join(", ")}, ?, ?)`)
     .bind(code, ...values, bool(b.compenso_visibile), stato)
@@ -1036,7 +1037,7 @@ function eventForUser(row: Record<string, unknown>, myStato: string) {
   const showFee = e.compenso_visibile && myStato === "confirmed";
   return {
     id: e.id, code: e.code, nome: e.nome, data: e.data, ora_ritrovo: e.ora_ritrovo, ora_inizio: e.ora_inizio, ora_fine: e.ora_fine,
-    luogo: e.luogo, tipo: e.tipo, tematica: e.tematica, descrizione: e.descrizione, stato: e.stato, motivo_annullamento: e.motivo_annullamento,
+    luogo: e.luogo, tipo: e.tipo, tematica: e.tematica, sigla: e.sigla, descrizione: e.descrizione, stato: e.stato, motivo_annullamento: e.motivo_annullamento,
     // informazioni operative e referente solo a chi è confermato
     info_operative: myStato === "confirmed" ? e.info_operative : "",
     referente_nome: myStato === "confirmed" ? e.referente_nome : "",
@@ -1166,6 +1167,150 @@ app.patch("/api/my/load-rows/:rid", async (c) => {
   }
   const updated = await c.env.DB.prepare("SELECT * FROM load_rows WHERE id = ?").bind(rid).first();
   return c.json({ success: true, row: loadRowFromRow(updated!) });
+});
+
+// ---------------------------------------------------------------------------
+// Foglio presenze: ogni user, per ogni evento in cui è confermato, scrive ruolo, tariffa e rimborsi.
+// A fine mese chiude il foglio: resta nel suo archivio personale 3 mesi.
+// ---------------------------------------------------------------------------
+
+const FOGLI_KEEP_DAYS = 90;
+const FP_FIELDS = { ruolo: 40, tariffa: 14, diaria: 14, pernotti: 14, viaggi: 14 } as const;
+type FpRow = { event_id: number; data: string; tipologia: string; location: string; ruolo: string; tariffa: string; diaria: string; pernotti: string; viaggi: string };
+
+const lastDayOf = (mese: string) => {
+  const [y, m] = mese.split("-").map(Number) as [number, number];
+  return `${mese}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, "0")}`;
+};
+
+async function foglioChiuso(db: D1Database, userId: number, mese: string) {
+  return !!(await db.prepare("SELECT id FROM fogli_presenza WHERE user_id = ? AND mese = ?").bind(userId, mese).first());
+}
+
+/** Le righe del foglio di un mese: eventi confermati ancora nell'app + quelli già archiviati (salvati in presenze). */
+async function foglioRighe(db: D1Database, userId: number, mese: string): Promise<FpRow[]> {
+  const live = await db
+    .prepare(
+      `SELECT e.id, e.data, e.sigla, e.tipo, e.nome, e.luogo FROM event_participants p JOIN events e ON e.id = p.event_id
+       WHERE p.user_id = ? AND p.stato = 'confirmed' AND e.stato != 'annullato' AND substr(e.data, 1, 7) = ?`,
+    )
+    .bind(userId, mese)
+    .all<{ id: number; data: string; sigla: string | null; tipo: string | null; nome: string; luogo: string | null }>();
+  const pres = await db.prepare("SELECT * FROM presenze WHERE user_id = ? AND mese = ?").bind(userId, mese).all<Record<string, string | number | null>>();
+  const byEvent = new Map(pres.results.map((r) => [r.event_id as number, r]));
+  const fields = (r: Record<string, string | number | null> | undefined) => ({
+    ruolo: String(r?.ruolo ?? ""), tariffa: String(r?.tariffa ?? ""), diaria: String(r?.diaria ?? ""), pernotti: String(r?.pernotti ?? ""), viaggi: String(r?.viaggi ?? ""),
+  });
+  const rows: FpRow[] = live.results.map((e) => ({
+    event_id: e.id, data: e.data, tipologia: e.sigla || e.tipo || e.nome, location: e.luogo ?? "", ...fields(byEvent.get(e.id)),
+  }));
+  // eventi non più nell'app (archiviati): restano con i dati salvati
+  const liveIds = new Set(live.results.map((e) => e.id));
+  const others = pres.results.filter((r) => !liveIds.has(r.event_id as number));
+  if (others.length) {
+    const still = await db.prepare(`SELECT id FROM events WHERE id IN (${others.map(() => "?").join(",")})`).bind(...others.map((r) => r.event_id)).all<{ id: number }>();
+    const exists = new Set(still.results.map((r) => r.id));
+    for (const r of others) {
+      if (exists.has(r.event_id as number)) continue; // l'evento c'è ancora ma lo user non è più confermato
+      rows.push({ event_id: r.event_id as number, data: String(r.data), tipologia: String(r.tipologia ?? ""), location: String(r.location ?? ""), ...fields(r) });
+    }
+  }
+  return rows.sort((a, b) => a.data.localeCompare(b.data) || a.event_id - b.event_id);
+}
+
+async function cleanFogli(db: D1Database) {
+  await db.prepare(`DELETE FROM fogli_presenza WHERE closed_at < datetime('now', '-${FOGLI_KEEP_DAYS} days')`).run();
+}
+
+app.get("/api/my/presenze/:code", async (c) => {
+  const me = c.get("me");
+  const row = await myParticipation(c, c.req.param("code"));
+  if (!row) return fail(c, 404, "Evento non trovato o non sei coinvolto");
+  if (row.mio_stato !== "confirmed") return fail(c, 403, "Il foglio presenza si compila solo per gli eventi in cui sei confermato");
+  const mese = String(row.data).slice(0, 7);
+  const p = await c.env.DB.prepare("SELECT * FROM presenze WHERE user_id = ? AND event_id = ?").bind(me.id, row.id).first<Record<string, string | null>>();
+  return c.json({
+    success: true,
+    mese,
+    chiuso: await foglioChiuso(c.env.DB, me.id as number, mese),
+    tipologia: (row.sigla as string) || (row.tipo as string) || (row.nome as string),
+    location: (row.luogo as string) ?? "",
+    data: row.data,
+    ruolo: p?.ruolo ?? "", tariffa: p?.tariffa ?? "", diaria: p?.diaria ?? "", pernotti: p?.pernotti ?? "", viaggi: p?.viaggi ?? "",
+  });
+});
+
+app.put("/api/my/presenze/:code", async (c) => {
+  const me = c.get("me");
+  const row = await myParticipation(c, c.req.param("code"));
+  if (!row) return fail(c, 404, "Evento non trovato o non sei coinvolto");
+  if (row.mio_stato !== "confirmed") return fail(c, 403, "Il foglio presenza si compila solo per gli eventi in cui sei confermato");
+  const mese = String(row.data).slice(0, 7);
+  if (await foglioChiuso(c.env.DB, me.id as number, mese)) return fail(c, 409, "Il foglio presenze di questo mese è già chiuso");
+  const b = await body(c);
+  const v = Object.fromEntries(Object.entries(FP_FIELDS).map(([k, max]) => [k, typeof b[k] === "string" ? (b[k] as string).replace(/\s+/g, " ").trim().slice(0, max) : ""]));
+  await c.env.DB
+    .prepare(
+      `INSERT INTO presenze (user_id, event_id, mese, data, tipologia, location, ruolo, tariffa, diaria, pernotti, viaggi)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, event_id) DO UPDATE SET mese = excluded.mese, data = excluded.data, tipologia = excluded.tipologia, location = excluded.location,
+         ruolo = excluded.ruolo, tariffa = excluded.tariffa, diaria = excluded.diaria, pernotti = excluded.pernotti, viaggi = excluded.viaggi, updated_at = datetime('now')`,
+    )
+    .bind(me.id, row.id, mese, row.data, (row.sigla as string) || (row.tipo as string) || (row.nome as string), (row.luogo as string) ?? "", v.ruolo, v.tariffa, v.diaria, v.pernotti, v.viaggi)
+    .run();
+  return c.json({ success: true });
+});
+
+app.get("/api/my/fogli", async (c) => {
+  const me = c.get("me");
+  await cleanFogli(c.env.DB);
+  const today = todayRome();
+  const chiusi = await c.env.DB
+    .prepare(`SELECT id, mese, closed_at, date(closed_at, '+${FOGLI_KEEP_DAYS} days') AS scade_il FROM fogli_presenza WHERE user_id = ? ORDER BY mese DESC`)
+    .bind(me.id)
+    .all<{ id: number; mese: string; closed_at: string; scade_il: string }>();
+  const closed = new Set(chiusi.results.map((r) => r.mese));
+  // mesi con eventi confermati (fino a quello in corso) o con righe già salvate, non ancora chiusi
+  const m1 = await c.env.DB
+    .prepare(
+      `SELECT DISTINCT substr(e.data, 1, 7) AS mese FROM event_participants p JOIN events e ON e.id = p.event_id
+       WHERE p.user_id = ? AND p.stato = 'confirmed' AND e.stato != 'annullato' AND substr(e.data, 1, 7) <= ?`,
+    )
+    .bind(me.id, today.slice(0, 7))
+    .all<{ mese: string }>();
+  const m2 = await c.env.DB.prepare("SELECT DISTINCT mese FROM presenze WHERE user_id = ?").bind(me.id).all<{ mese: string }>();
+  const mesi = [...new Set([...m1.results, ...m2.results].map((r) => r.mese))].filter((m) => !closed.has(m)).sort().reverse();
+  const aperti = [];
+  for (const mese of mesi) {
+    const righe = await foglioRighe(c.env.DB, me.id as number, mese);
+    if (righe.length) aperti.push({ mese, righe, chiudibile: today >= lastDayOf(mese), chiudibile_dal: lastDayOf(mese) });
+  }
+  return c.json({ success: true, aperti, chiusi: chiusi.results.map((r) => ({ ...r, quando: romeDateTime(r.closed_at) })) });
+});
+
+app.post("/api/my/fogli/:mese/chiudi", async (c) => {
+  const me = c.get("me");
+  const mese = c.req.param("mese");
+  if (!/^\d{4}-\d{2}$/.test(mese)) return fail(c, 400, "Mese non valido");
+  if (todayRome() < lastDayOf(mese)) return fail(c, 400, "Il foglio si può chiudere dall'ultimo giorno del mese");
+  if (await foglioChiuso(c.env.DB, me.id as number, mese)) return fail(c, 409, "Questo foglio è già chiuso");
+  const righe = await foglioRighe(c.env.DB, me.id as number, mese);
+  if (!righe.length) return fail(c, 400, "Nessun evento in questo mese");
+  await c.env.DB
+    .prepare("INSERT INTO fogli_presenza (user_id, mese, nome, cognome, righe_json) VALUES (?, ?, ?, ?, ?)")
+    .bind(me.id, mese, me.nome, me.cognome, JSON.stringify(righe))
+    .run();
+  await c.env.DB.prepare("DELETE FROM presenze WHERE user_id = ? AND mese = ?").bind(me.id, mese).run();
+  return c.json({ success: true });
+});
+
+app.get("/api/my/fogli/chiusi/:id", async (c) => {
+  const me = c.get("me");
+  const id = intParam(c, "id");
+  if (!id) return fail(c, 400, "ID non valido");
+  const row = await c.env.DB.prepare("SELECT mese, nome, cognome, righe_json FROM fogli_presenza WHERE id = ? AND user_id = ?").bind(id, me.id).first<{ mese: string; nome: string; cognome: string; righe_json: string }>();
+  if (!row) return fail(c, 404, "Foglio non trovato (forse è già scaduto)");
+  return c.json({ success: true, mese: row.mese, nome: row.nome, cognome: row.cognome, righe: JSON.parse(row.righe_json) as FpRow[] });
 });
 
 // ---------------------------------------------------------------------------
@@ -1478,6 +1623,15 @@ async function archiveEvent(db: D1Database, eventId: number): Promise<boolean> {
   await db.prepare("INSERT INTO event_archives (code, nome, data, testo) VALUES (?, ?, ?, ?)").bind(r.event.code, r.event.nome, r.event.data, r.testo).run();
   await db.prepare("DELETE FROM notifications WHERE event_id = ?").bind(eventId).run();
   await db.prepare("DELETE FROM load_rows WHERE event_id = ?").bind(eventId).run();
+  // chi era confermato tiene la riga nel suo foglio presenza anche dopo l'archiviazione
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO presenze (user_id, event_id, mese, data, tipologia, location)
+       SELECT p.user_id, e.id, substr(e.data, 1, 7), e.data, COALESCE(NULLIF(e.sigla, ''), NULLIF(e.tipo, ''), e.nome), e.luogo
+       FROM event_participants p JOIN events e ON e.id = p.event_id WHERE p.event_id = ? AND p.stato = 'confirmed'`,
+    )
+    .bind(eventId)
+    .run();
   await db.prepare("DELETE FROM event_participants WHERE event_id = ?").bind(eventId).run();
   await db.prepare("DELETE FROM events WHERE id = ?").bind(eventId).run();
   return true;
@@ -1667,5 +1821,6 @@ export default {
     // pulizia notturna della Taverna (i messaggi durano 24 ore)
     ctx.waitUntil(cleanTaverna(env.DB).catch(() => undefined));
     ctx.waitUntil(cleanReports(env.DB).catch(() => undefined));
+    ctx.waitUntil(cleanFogli(env.DB).catch(() => undefined));
   },
 };
