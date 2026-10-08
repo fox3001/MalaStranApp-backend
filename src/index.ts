@@ -1165,6 +1165,27 @@ app.get("/api/my/events", async (c) => {
   });
 });
 
+// Calendario dello user: TUTTI gli eventi. Di quelli a cui non è stato chiamato vede solo giorno e tema.
+app.get("/api/my/calendario", async (c) => {
+  const me = c.get("me");
+  const rows = await c.env.DB
+    .prepare(
+      `SELECT e.code, e.data, e.tematica, e.tipo, e.stato, p.stato AS mio_stato FROM events e
+       LEFT JOIN event_participants p ON p.event_id = e.id AND p.user_id = ?
+       WHERE e.stato != 'annullato' ORDER BY e.data`,
+    )
+    .bind(me.id)
+    .all<{ code: string; data: string; tematica: string | null; tipo: string | null; stato: string; mio_stato: string | null }>();
+  return c.json({
+    success: true,
+    eventi: rows.results.map((r) =>
+      r.mio_stato
+        ? { code: r.code, data: r.data, tema: r.tematica || r.tipo || "", mio_stato: r.mio_stato }
+        : { code: null, data: r.data, tema: r.tematica || "", mio_stato: null },
+    ),
+  });
+});
+
 async function myParticipation(c: C, code: string) {
   const me = c.get("me");
   return c.env.DB
