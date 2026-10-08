@@ -1168,6 +1168,7 @@ app.get("/api/my/events", async (c) => {
 // Calendario dello user: i suoi eventi + tutti gli eventi CONFERMATI dall'admin. Di quelli a cui non è stato chiamato vede solo giorno e tema.
 app.get("/api/my/calendario", async (c) => {
   const me = c.get("me");
+  await seedDemoEvents(c.env.DB).catch((err) => console.error("eventi demo", err));
   const rows = await c.env.DB
     .prepare(
       `SELECT e.code, e.data, e.tematica, e.tipo, e.stato, p.stato AS mio_stato FROM events e
