@@ -1256,15 +1256,17 @@ app.post("/api/my/events/:code/availability", async (c) => {
   if (stato !== "available" && stato !== "unavailable") return fail(c, 400, "Risposta non valida");
   if (row.mio_stato === "confirmed" || row.mio_stato === "rejected") return fail(c, 409, "L'admin ha già deciso: per cambiare contatta l'ufficio");
   if (row.stato === "annullato" || row.stato === "chiuso") return fail(c, 409, "L'evento non accetta più risposte");
+  // chi dice "Ci sono" è confermato subito (decisione dell'admin): vede la scheda completa dell'evento
+  const nuovo = stato === "available" ? "confirmed" : "unavailable";
   await c.env.DB
     .prepare("UPDATE event_participants SET stato = ?, nota_user = ?, responded_at = datetime('now') WHERE event_id = ? AND user_id = ?")
-    .bind(stato, str(b.nota, 1000), row.id, me.id)
+    .bind(nuovo, str(b.nota, 1000), row.id, me.id)
     .run();
   const who = `${me.nome} ${me.cognome}`.trim();
   await notifyAdmin(
     c.env.DB,
     "risposta",
-    stato === "available" ? `${who} ha dato disponibilità per ${row.nome as string}` : `${who} non è disponibile per ${row.nome as string}`,
+    stato === "available" ? `${who} ha accettato ed è confermato per ${row.nome as string}` : `${who} non è disponibile per ${row.nome as string}`,
     row.id as number,
   );
   return c.json({ success: true });

@@ -5,7 +5,7 @@
 
 import { SEED2_EVENT_CODE, SEED_EVENT_CODE, seedSecondoEvento, seedVillaLongoni } from "./seed-villa-longoni";
 
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 
 const TABLES: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -327,6 +327,13 @@ async function migrate(db: D1Database): Promise<void> {
   // richiesta dell'admin: nell'evento di prova sono team leader tutti gli user chiamati
   if (previous > 0 && previous < 9) await seedSecondoEvento(db);
   // richiesta dell'admin: agli eventi di prova si dà solo una tematica (è quella che vedono gli user nel calendario)
+  // richiesta dell'admin: chi accetta è subito confermato; chi aveva già accettato negli eventi aperti diventa confermato
+  if (previous > 0 && previous < 20) {
+    await db
+      .prepare("UPDATE event_participants SET stato = 'confirmed' WHERE stato = 'available' AND event_id IN (SELECT id FROM events WHERE stato NOT IN ('annullato', 'chiuso'))")
+      .run()
+      .catch(() => undefined);
+  }
   if (previous > 0 && previous < 18) {
     // i messaggi dell'admin già salvati passano nel nuovo registro della chat (che ora tiene anche quelli degli user)
     await db
